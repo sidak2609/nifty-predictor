@@ -1,5 +1,6 @@
 """
-External signal module — adds global market context and news sentiment.
+External signal module — global market context, institutional flows,
+options market, social sentiment, and market breadth.
 All sources are 100% free, no API keys required.
 """
 
@@ -36,22 +37,34 @@ _NEG = {
 
 # ── Global market tickers ──────────────────────────────────────────────────
 GLOBAL_TICKERS = {
-    "sp500":      "^GSPC",      # S&P 500
-    "nasdaq":     "^IXIC",      # Nasdaq
-    "dow":        "^DJI",       # Dow Jones
-    "vix":        "^VIX",       # CBOE VIX (global fear)
-    "india_vix":  "^INDIAVIX",  # India VIX
-    "nikkei":     "^N225",      # Japan (Asian proxy)
-    "hangseng":   "^HSI",       # Hong Kong
-    "usdinr":     "INR=X",      # USD/INR (inverse: higher = INR weaker)
-    "gold":       "GC=F",       # Gold futures
-    "crude":      "CL=F",       # Crude oil (WTI)
-    "sgx_nifty":  "^NSEI",      # Gift/SGX Nifty proxy (spot)
+    "sp500":     "^GSPC",
+    "nasdaq":    "^IXIC",
+    "dow":       "^DJI",
+    "vix":       "^VIX",
+    "india_vix": "^INDIAVIX",
+    "nikkei":    "^N225",
+    "hangseng":  "^HSI",
+    "usdinr":    "INR=X",
+    "gold":      "GC=F",
+    "crude":     "CL=F",
+    "sgx_nifty": "^NSEI",
+}
+
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
 }
 
 
+# ── Helpers ────────────────────────────────────────────────────────────────
 def _safe_pct_change(series: pd.Series) -> float:
-    """Return latest 1-day % change, or 0.0 on error."""
     try:
         s = series.dropna()
         if len(s) < 2:
@@ -68,33 +81,32 @@ def _safe_last(series: pd.Series) -> float:
         return 0.0
 
 
+def _get_nse_session() -> requests.Session:
+    """Create a requests.Session with NSE cookies."""
+    session = requests.Session()
+    session.headers.update(_NSE_HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=10)
+    except Exception:
+        pass
+    return session
+
+
+# ── Global markets ─────────────────────────────────────────────────────────
 def fetch_global_markets() -> dict:
-    """
-    Fetch latest daily close for global market proxies.
-    Returns a dict of feature_name → value.
-    """
     features = {}
     try:
         symbols = list(GLOBAL_TICKERS.values())
         raw = yf.download(
-            symbols,
-            period="5d",
-            interval="1d",
-            auto_adjust=True,
-            progress=False,
-            group_by="ticker",
+            symbols, period="5d", interval="1d",
+            auto_adjust=True, progress=False, group_by="ticker",
         )
-
         for name, sym in GLOBAL_TICKERS.items():
             try:
-                if len(symbols) == 1:
-                    close = raw["Close"]
-                else:
-                    close = raw[sym]["Close"] if sym in raw.columns.get_level_values(0) else pd.Series()
-
+                close = raw[sym]["Close"] if sym in raw.columns.get_level_values(0) else pd.Series()
                 if name == "india_vix":
-                    features["india_vix"]        = _safe_last(close)
-                    features["india_vix_change"]  = _safe_pct_change(close)
+                    features["india_vix"]       = _safe_last(close)
+                    features["india_vix_change"] = _safe_pct_change(close)
                 elif name == "vix":
                     features["vix_level"]  = _safe_last(close)
                     features["vix_change"] = _safe_pct_change(close)
@@ -105,84 +117,163 @@ def fetch_global_markets() -> dict:
                     features[f"{name}_change"] = _safe_pct_change(close)
             except Exception:
                 features[f"{name}_change"] = 0.0
-
     except Exception:
-        # Fallback: all zeros
         for name in GLOBAL_TICKERS:
             features[f"{name}_change"] = 0.0
-        features.update({"india_vix": 15.0, "india_vix_change": 0.0,
-                         "vix_level": 20.0, "vix_change": 0.0,
-                         "usdinr": 84.0, "usdinr_change": 0.0})
-
+        features.update({
+            "india_vix": 15.0, "india_vix_change": 0.0,
+            "vix_level": 20.0, "vix_change": 0.0,
+            "usdinr": 84.0,    "usdinr_change": 0.0,
+        })
     return features
 
 
+# ── FII / DII institutional flows ─────────────────────────────────────────
+def fetch_fii_dii(session: requests.Session) -> dict:
+    fallback = {"fii_net": 0.0, "dii_net": 0.0, "fii_dii_ratio": 0.0}
+    try:
+        url = "https://www.nseindia.com/api/fiidiiTradeReact"
+        resp = session.get(url, timeout=8)
+        data = resp.json()
+        fii_net = dii_net = 0.0
+        for row in data:
+            cat = row.get("category", "").upper()
+            net = float(str(row.get("netValue", "0")).replace(",", ""))
+            if "FII" in cat or "FPI" in cat:
+                fii_net = net
+            elif "DII" in cat:
+                dii_net = net
+        ratio = fii_net / dii_net if dii_net != 0 else 0.0
+        return {
+            "fii_net":       round(fii_net, 2),
+            "dii_net":       round(dii_net, 2),
+            "fii_dii_ratio": round(ratio, 4),
+        }
+    except Exception:
+        return fallback
+
+
+# ── PCR — Put-Call Ratio ───────────────────────────────────────────────────
+def fetch_pcr(session: requests.Session) -> dict:
+    fallback = {"pcr": 1.0, "pcr_signal": 0.0}
+    try:
+        url = "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY"
+        resp = session.get(url, timeout=10)
+        data = resp.json()
+        ce_oi = data["filtered"]["CE"]["totOI"]
+        pe_oi = data["filtered"]["PE"]["totOI"]
+        pcr = pe_oi / ce_oi if ce_oi > 0 else 1.0
+        # PCR > 1.2 = too many puts → contrarian bullish; < 0.8 = too many calls → contrarian bearish
+        signal = -1.0 if pcr > 1.2 else (1.0 if pcr < 0.8 else 0.0)
+        return {"pcr": round(pcr, 4), "pcr_signal": signal}
+    except Exception:
+        return fallback
+
+
+# ── Reddit sentiment ───────────────────────────────────────────────────────
+def fetch_reddit_sentiment() -> dict:
+    fallback = {"reddit_sentiment": 0.0, "reddit_count": 0}
+    headers = {"User-Agent": "NiftyPredictor/1.0 (educational project)"}
+    all_texts = []
+    try:
+        for sub in ["IndiaInvestments", "IndianStockMarket"]:
+            url = f"https://www.reddit.com/r/{sub}/hot.json?limit=25"
+            resp = requests.get(url, headers=headers, timeout=8)
+            posts = resp.json()["data"]["children"]
+            for p in posts:
+                title    = p["data"].get("title", "").lower()
+                selftext = p["data"].get("selftext", "").lower()
+                all_texts.append(title + " " + selftext)
+        if not all_texts:
+            return fallback
+        pos = neg = 0
+        for text in all_texts:
+            words = set(re.findall(r"[a-z]+", text))
+            pos += len(words & _POS)
+            neg += len(words & _NEG)
+        total = pos + neg
+        score = (pos - neg) / total if total > 0 else 0.0
+        return {
+            "reddit_sentiment": round(score, 4),
+            "reddit_count":     len(all_texts),
+        }
+    except Exception:
+        return fallback
+
+
+# ── Market breadth ─────────────────────────────────────────────────────────
+def fetch_market_breadth() -> dict:
+    fallback = {"breadth_pct_above_ema50": 0.5}
+    try:
+        from src.constants import NIFTY50_SYMBOLS
+        symbols = [s for s in NIFTY50_SYMBOLS.keys() if not s.startswith("^")]
+        raw = yf.download(
+            symbols, period="90d", interval="1d",
+            auto_adjust=True, progress=False, group_by="ticker",
+        )
+        above = counted = 0
+        for sym in symbols:
+            try:
+                close = raw[sym]["Close"].dropna() if len(symbols) > 1 else raw["Close"].dropna()
+                if len(close) < 50:
+                    continue
+                ema50 = close.ewm(span=50, adjust=False).mean()
+                if close.iloc[-1] > ema50.iloc[-1]:
+                    above += 1
+                counted += 1
+            except Exception:
+                continue
+        if counted == 0:
+            return fallback
+        return {"breadth_pct_above_ema50": round(above / counted, 4)}
+    except Exception:
+        return fallback
+
+
+# ── Google News sentiment ──────────────────────────────────────────────────
 def fetch_news_sentiment(query: str = "Nifty India stock market") -> dict:
-    """
-    Fetch Google News RSS and score sentiment using keyword matching.
-    Returns sentiment_score (-1 to +1) and article_count.
-    """
     try:
         encoded = query.replace(" ", "+")
-        url = (
-            f"https://news.google.com/rss/search"
-            f"?q={encoded}&hl=en-IN&gl=IN&ceid=IN:en"
-        )
+        url = f"https://news.google.com/rss/search?q={encoded}&hl=en-IN&gl=IN&ceid=IN:en"
         resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
         root = ET.fromstring(resp.content)
-
         titles, descriptions = [], []
-        for item in root.findall(".//item")[:20]:   # latest 20 articles
-            t = item.findtext("title", "") or ""
-            d = item.findtext("description", "") or ""
-            titles.append(t.lower())
-            descriptions.append(d.lower())
-
+        for item in root.findall(".//item")[:20]:
+            titles.append((item.findtext("title", "") or "").lower())
+            descriptions.append((item.findtext("description", "") or "").lower())
         if not titles:
-            return {"news_sentiment": 0.0, "news_count": 0,
-                    "news_pos": 0, "news_neg": 0}
-
-        pos_count = neg_count = 0
+            return {"news_sentiment": 0.0, "news_count": 0, "news_pos": 0, "news_neg": 0}
+        pos = neg = 0
         for text in titles + descriptions:
             words = set(re.findall(r"[a-z]+", text))
-            pos_count += len(words & _POS)
-            neg_count += len(words & _NEG)
-
-        total = pos_count + neg_count
-        score = (pos_count - neg_count) / total if total > 0 else 0.0
-
-        return {
-            "news_sentiment": round(score, 4),
-            "news_count":     len(titles),
-            "news_pos":       pos_count,
-            "news_neg":       neg_count,
-        }
-
+            pos += len(words & _POS)
+            neg += len(words & _NEG)
+        total = pos + neg
+        score = (pos - neg) / total if total > 0 else 0.0
+        return {"news_sentiment": round(score, 4), "news_count": len(titles),
+                "news_pos": pos, "news_neg": neg}
     except Exception:
-        return {"news_sentiment": 0.0, "news_count": 0,
-                "news_pos": 0, "news_neg": 0}
+        return {"news_sentiment": 0.0, "news_count": 0, "news_pos": 0, "news_neg": 0}
 
 
+# ── Master fetch ───────────────────────────────────────────────────────────
 def get_all_external_features(symbol: str) -> dict:
-    """
-    Combine global market + news sentiment into one dict.
-    Used to enrich the 10-min feature dataframe.
-    """
-    # Strip exchange suffix for news query
-    name = symbol.replace(".NS", "").replace("^NSEI", "Nifty 50").replace("^", "")
+    name  = symbol.replace(".NS", "").replace("^NSEI", "Nifty 50").replace("^", "")
     query = f"{name} India stock market NSE"
+
+    nse_session = _get_nse_session()   # one session for both NSE endpoints
 
     markets = fetch_global_markets()
     news    = fetch_news_sentiment(query)
+    fii_dii = fetch_fii_dii(nse_session)
+    pcr     = fetch_pcr(nse_session)
+    reddit  = fetch_reddit_sentiment()
+    breadth = fetch_market_breadth()
 
-    return {**markets, **news}
+    return {**markets, **news, **fii_dii, **pcr, **reddit, **breadth}
 
 
 def merge_into_df(df: pd.DataFrame, ext: dict) -> pd.DataFrame:
-    """
-    Broadcast external (daily) features into the 10-min OHLCV dataframe.
-    Every row gets the same external feature values (they're daily signals).
-    """
     df = df.copy()
     for k, v in ext.items():
         df[k] = float(v) if v is not None else 0.0
@@ -198,4 +289,8 @@ SENTIMENT_FEATURE_COLS = [
     "usdinr", "usdinr_change",
     "gold_change", "crude_change",
     "news_sentiment", "news_count",
+    "fii_net", "dii_net", "fii_dii_ratio",
+    "pcr", "pcr_signal",
+    "reddit_sentiment", "reddit_count",
+    "breadth_pct_above_ema50",
 ]
