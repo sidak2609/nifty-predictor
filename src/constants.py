@@ -1,4 +1,5 @@
 NIFTY50_SYMBOLS = {
+    "^NSEI":         "Nifty 50 Index",
     "ADANIENT.NS":   "Adani Enterprises",
     "ADANIPORTS.NS": "Adani Ports",
     "APOLLOHOSP.NS": "Apollo Hospitals",

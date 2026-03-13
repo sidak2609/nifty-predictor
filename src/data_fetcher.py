@@ -56,7 +56,14 @@ def fetch_ohlcv(symbol: str, days: int = 55) -> pd.DataFrame:
     )
 
     # Drop candles with zero volume (pre-market artefacts)
-    df = df[df["volume"] > 0]
+    # Indices (^NSEI etc.) have no volume — skip the filter for them
+    is_index = symbol.startswith("^")
+    if not is_index:
+        df = df[df["volume"] > 0]
+    else:
+        # Fill volume with 0 for indices (volume not available)
+        df["volume"] = df["volume"].fillna(0)
+        df = df[df["close"].notna()]
 
     return df
 

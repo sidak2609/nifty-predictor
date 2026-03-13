@@ -35,9 +35,10 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["body_size"]    = abs(df["close"] - df["open"]) / df["close"]
 
     # ── Volume features ────────────────────────────────────────────────────
-    df["vol_sma20"]   = df["volume"].rolling(20).mean()
-    df["vol_ratio"]   = df["volume"] / df["vol_sma20"].replace(0, np.nan)
-    df["vol_returns"] = df["volume"].pct_change(1)
+    has_volume = df["volume"].sum() > 0
+    df["vol_sma20"]   = df["volume"].rolling(20).mean() if has_volume else 0.0
+    df["vol_ratio"]   = (df["volume"] / df["vol_sma20"].replace(0, np.nan)).fillna(1.0) if has_volume else 1.0
+    df["vol_returns"] = df["volume"].pct_change(1).fillna(0.0) if has_volume else 0.0
 
     # ── Moving averages ────────────────────────────────────────────────────
     df["ema9"]  = ta.trend.ema_indicator(df["close"], window=9)
@@ -86,13 +87,19 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["stoch_diff"] = df["stoch_k"] - df["stoch_d"]
 
     # ── OBV ────────────────────────────────────────────────────────────────
-    df["obv"]      = ta.volume.on_balance_volume(df["close"], df["volume"])
-    df["obv_sma20"] = df["obv"].rolling(20).mean()
-    df["obv_ratio"] = df["obv"] / df["obv_sma20"].replace(0, np.nan)
+    if has_volume:
+        df["obv"]       = ta.volume.on_balance_volume(df["close"], df["volume"])
+        df["obv_sma20"] = df["obv"].rolling(20).mean()
+        df["obv_ratio"] = (df["obv"] / df["obv_sma20"].replace(0, np.nan)).fillna(1.0)
+    else:
+        df["obv_ratio"] = 1.0
 
     # ── VWAP ───────────────────────────────────────────────────────────────
-    df = _add_vwap(df)
-    df["price_vs_vwap"] = (df["close"] - df["vwap"]) / df["vwap"]
+    if has_volume:
+        df = _add_vwap(df)
+        df["price_vs_vwap"] = (df["close"] - df["vwap"]) / df["vwap"]
+    else:
+        df["price_vs_vwap"] = 0.0
 
     # ── Supertrend (simplified) ────────────────────────────────────────────
     # Uses ATR multiplier 3 on period 10

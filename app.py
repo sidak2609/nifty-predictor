@@ -198,7 +198,7 @@ def scan_all_stocks() -> list[dict]:
             pred = model.predict(df)
             if pred and pred["confidence"] >= MIN_CONFIDENCE * 100:
                 results.append({
-                    "Symbol":     sym.replace(".NS", ""),
+                    "Symbol":     sym.replace(".NS", "").replace("^", ""),
                     "Name":       name,
                     "Price (₹)":  pred["current_price"],
                     "Target (₹)": pred["predicted_price"],
@@ -234,9 +234,9 @@ with st.sidebar:
     st.divider()
 
     symbol_options = list(NIFTY50_SYMBOLS.keys())
-    display_names  = [f"{s.replace('.NS','')} — {n}" for s, n in NIFTY50_SYMBOLS.items()]
+    display_names  = [f"{s.replace('.NS','').replace('^','')} — {n}" for s, n in NIFTY50_SYMBOLS.items()]
     selected_idx   = st.selectbox("Select Stock", range(len(symbol_options)),
-                                  format_func=lambda i: display_names[i], index=36)   # RELIANCE default
+                                  format_func=lambda i: display_names[i], index=0)   # Nifty50 Index default
     selected_symbol = symbol_options[selected_idx]
     selected_name   = NIFTY50_SYMBOLS[selected_symbol]
 
@@ -255,7 +255,7 @@ with st.sidebar:
         st.rerun()
 
 # ── Header ────────────────────────────────────────────────────────────────────
-st.title(f"📈  {selected_name}  ({selected_symbol.replace('.NS','')})")
+st.title(f"📈  {selected_name}  ({selected_symbol.replace('.NS','').replace('^','')})")
 
 # ── Load data & train ─────────────────────────────────────────────────────────
 with st.spinner(f"Loading data and training model for {selected_symbol}…"):
