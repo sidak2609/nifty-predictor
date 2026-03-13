@@ -29,10 +29,13 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["returns_3"]  = df["close"].pct_change(3)
     df["returns_5"]  = df["close"].pct_change(5)
     df["returns_10"] = df["close"].pct_change(10)
-    df["hl_pct"]     = (df["high"] - df["low"]) / df["close"]
-    df["upper_shadow"] = (df["high"] - df[["open", "close"]].max(axis=1)) / df["close"]
-    df["lower_shadow"] = (df[["open", "close"]].min(axis=1) - df["low"]) / df["close"]
-    df["body_size"]    = abs(df["close"] - df["open"]) / df["close"]
+
+    # Price acceleration (momentum change)
+    df["accel_1"] = df["returns_1"] - df["returns_2"]
+    df["accel_3"] = df["returns_3"] - df["returns_5"]
+
+    df["hl_pct"]    = (df["high"] - df["low"]) / df["close"]
+    df["body_size"] = abs(df["close"] - df["open"]) / df["close"]
 
     # ── Volume features ────────────────────────────────────────────────────
     has_volume = df["volume"].sum() > 0
@@ -44,39 +47,39 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ema9"]  = ta.trend.ema_indicator(df["close"], window=9)
     df["ema21"] = ta.trend.ema_indicator(df["close"], window=21)
     df["ema50"] = ta.trend.ema_indicator(df["close"], window=50)
-    df["sma20"] = df["close"].rolling(20).mean()
 
-    df["price_vs_ema9"]  = (df["close"] - df["ema9"])  / df["ema9"]
-    df["price_vs_ema21"] = (df["close"] - df["ema21"]) / df["ema21"]
-    df["price_vs_ema50"] = (df["close"] - df["ema50"]) / df["ema50"]
-    df["ema9_vs_ema21"]  = (df["ema9"] - df["ema21"])  / df["ema21"]
+    df["price_vs_ema9"]    = (df["close"] - df["ema9"])  / df["ema9"]
+    df["price_vs_ema21"]   = (df["close"] - df["ema21"]) / df["ema21"]
+    df["price_vs_ema50"]   = (df["close"] - df["ema50"]) / df["ema50"]
+    df["ema9_vs_ema21"]    = (df["ema9"] - df["ema21"])  / df["ema21"]
     df["ema9_cross_ema21"] = (df["ema9"] > df["ema21"]).astype(int)
 
     # ── RSI ────────────────────────────────────────────────────────────────
     df["rsi14"] = ta.momentum.rsi(df["close"], window=14)
     df["rsi7"]  = ta.momentum.rsi(df["close"], window=7)
-    df["rsi_diff"] = df["rsi14"].diff(1)
+    df["rsi_diverge"] = df["rsi14"] - df["rsi7"]   # RSI divergence
 
     # ── MACD ───────────────────────────────────────────────────────────────
     macd = ta.trend.MACD(df["close"], window_slow=26, window_fast=12, window_sign=9)
     df["macd"]      = macd.macd()
     df["macd_sig"]  = macd.macd_signal()
     df["macd_hist"] = macd.macd_diff()
-    df["macd_cross"] = (df["macd"] > df["macd_sig"]).astype(int)
 
     # ── Bollinger Bands ────────────────────────────────────────────────────
     bb = ta.volatility.BollingerBands(df["close"], window=20, window_dev=2)
-    df["bb_upper"]  = bb.bollinger_hband()
-    df["bb_lower"]  = bb.bollinger_lband()
-    df["bb_mid"]    = bb.bollinger_mavg()
-    df["bb_pct_b"]  = bb.bollinger_pband()   # 0-1: position within bands
-    df["bb_width"]  = bb.bollinger_wband()   # band width
+    df["bb_pct_b"] = bb.bollinger_pband()   # position within bands (0-1)
 
     # ── ATR ────────────────────────────────────────────────────────────────
-    df["atr14"] = ta.volatility.average_true_range(
-        df["high"], df["low"], df["close"], window=14
-    )
-    df["atr_pct"] = df["atr14"] / df["close"]   # normalised
+    df["atr14"]   = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=14)
+    df["atr_pct"] = df["atr14"] / df["close"]
+
+    # ── ADX (regime strength) ──────────────────────────────────────────────
+    adx = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
+    df["adx"]     = adx.adx()
+    df["adx_pos"] = adx.adx_pos()   # +DI
+    df["adx_neg"] = adx.adx_neg()   # -DI
+    df["di_diff"] = df["adx_pos"] - df["adx_neg"]  # directional bias
+    df["trending"] = (df["adx"] > 25).astype(int)  # 1=trending, 0=ranging
 
     # ── Stochastic ─────────────────────────────────────────────────────────
     stoch = ta.momentum.StochasticOscillator(
@@ -84,7 +87,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     )
     df["stoch_k"] = stoch.stoch()
     df["stoch_d"] = stoch.stoch_signal()
-    df["stoch_diff"] = df["stoch_k"] - df["stoch_d"]
 
     # ── OBV ────────────────────────────────────────────────────────────────
     if has_volume:
@@ -101,13 +103,19 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["price_vs_vwap"] = 0.0
 
-    # ── Supertrend (simplified) ────────────────────────────────────────────
-    # Uses ATR multiplier 3 on period 10
-    _hl2 = (df["high"] + df["low"]) / 2
-    _atr10 = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=10)
-    df["supertrend_upper"] = _hl2 + 3 * _atr10
-    df["supertrend_lower"] = _hl2 - 3 * _atr10
-    df["above_supertrend"] = (df["close"] > df["supertrend_lower"]).astype(int)
+    # ── Rolling price statistics ───────────────────────────────────────────
+    df["rolling_std10"] = df["close"].rolling(10).std() / df["close"]
+    df["range10_pct"]   = (
+        (df["close"].rolling(10).max() - df["close"].rolling(10).min())
+        / df["close"].rolling(10).min()
+    )
+
+    # Rolling autocorrelation of returns (lag-1) — captures momentum persistence
+    df["ret_autocorr5"] = (
+        df["returns_1"].rolling(10)
+        .apply(lambda x: x.autocorr(lag=1) if x.std() > 0 else 0, raw=False)
+        .fillna(0)
+    )
 
     # ── Previous-day high / low / close ────────────────────────────────────
     daily = df[["high", "low", "close"]].resample("1D").agg(
@@ -116,7 +124,6 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     daily = daily[daily["d_close"].notna()]
     prev_day = daily.shift(1)
 
-    # Merge by normalised date
     df_date = df.index.normalize().tz_localize(None) if df.index.tzinfo else df.index.normalize()
     prev_day.index = prev_day.index.tz_localize(None) if prev_day.index.tzinfo else prev_day.index
 
@@ -128,55 +135,57 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["dist_prev_low"]   = (df["close"] - df["prev_d_low"])   / df["prev_d_low"]
     df["dist_prev_close"] = (df["close"] - df["prev_d_close"]) / df["prev_d_close"]
 
-    # ── Time features (cyclical encoding) ─────────────────────────────────
-    total_minutes = (15 * 60 + 30) - (9 * 60 + 15)   # 375 min session
+    # ── Time features ──────────────────────────────────────────────────────
+    total_minutes = (15 * 60 + 30) - (9 * 60 + 15)
     elapsed = (df.index.hour * 60 + df.index.minute) - (9 * 60 + 15)
     df["session_progress"] = np.clip(elapsed / total_minutes, 0, 1)
-
     df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
-    df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
-    df["dow_sin"]  = np.sin(2 * np.pi * df.index.dayofweek / 5)
-    df["dow_cos"]  = np.cos(2 * np.pi * df.index.dayofweek / 5)
 
     df["is_open_rush"]  = (
-        (df.index.hour == 9)  | ((df.index.hour == 10) & (df.index.minute == 0))
+        (df.index.hour == 9) | ((df.index.hour == 10) & (df.index.minute == 0))
     ).astype(int)
     df["is_close_rush"] = (df.index.hour == 15).astype(int)
     df["is_lunch"]      = (
-        (df.index.hour == 12) & (df.index.minute >= 30) |
-        (df.index.hour == 13) & (df.index.minute <= 30)
+        ((df.index.hour == 12) & (df.index.minute >= 30)) |
+        ((df.index.hour == 13) & (df.index.minute <= 30))
     ).astype(int)
 
-    # ── Rolling price statistics ───────────────────────────────────────────
-    df["rolling_std10"]  = df["close"].rolling(10).std() / df["close"]
-    df["rolling_max10"]  = df["close"].rolling(10).max()
-    df["rolling_min10"]  = df["close"].rolling(10).min()
-    df["range10_pct"]    = (df["rolling_max10"] - df["rolling_min10"]) / df["rolling_min10"]
-
-    # ── Target ────────────────────────────────────────────────────────────
+    # ── Targets ────────────────────────────────────────────────────────────
+    df["target_return"]    = df["close"].pct_change(1).shift(-1)   # next candle return
     df["target_price"]     = df["close"].shift(-1)
-    df["target_direction"] = (df["target_price"] > df["close"]).astype(int)
-    df["target_return"]    = (df["target_price"] - df["close"]) / df["close"]
+    df["target_direction"] = (df["target_return"] > 0).astype(int)
 
     return df
 
 
+# Curated feature set — removed near-zero-correlation features
 FEATURE_COLS = [
+    # Price momentum (highest signal)
     "returns_1", "returns_2", "returns_3", "returns_5", "returns_10",
-    "hl_pct", "upper_shadow", "lower_shadow", "body_size",
+    "accel_1", "accel_3",
+    "hl_pct", "body_size",
+    # Volume
     "vol_ratio", "vol_returns",
-    "price_vs_ema9", "price_vs_ema21", "price_vs_ema50", "ema9_vs_ema21", "ema9_cross_ema21",
-    "rsi14", "rsi7", "rsi_diff",
-    "macd", "macd_sig", "macd_hist", "macd_cross",
-    "bb_pct_b", "bb_width",
+    # Moving averages (top correlated group)
+    "price_vs_ema9", "price_vs_ema21", "price_vs_ema50",
+    "ema9_vs_ema21", "ema9_cross_ema21",
+    # Oscillators
+    "rsi14", "rsi7", "rsi_diverge",
+    "macd", "macd_sig", "macd_hist",
+    "bb_pct_b",
+    # Volatility
     "atr_pct",
-    "stoch_k", "stoch_d", "stoch_diff",
-    "obv_ratio",
-    "price_vs_vwap",
-    "above_supertrend",
+    # Regime (ADX)
+    "adx", "di_diff", "trending",
+    # Stochastic
+    "stoch_k", "stoch_d",
+    # OBV + VWAP
+    "obv_ratio", "price_vs_vwap",
+    # Rolling stats
+    "rolling_std10", "range10_pct", "ret_autocorr5",
+    # Previous-day levels
     "dist_prev_high", "dist_prev_low", "dist_prev_close",
-    "session_progress",
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+    # Time
+    "session_progress", "hour_sin",
     "is_open_rush", "is_close_rush", "is_lunch",
-    "rolling_std10", "range10_pct",
 ]
