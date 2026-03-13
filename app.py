@@ -224,12 +224,16 @@ with tab_intraday:
     with st.spinner("Loading data & training intraday model..."):
         try:
             df_raw       = load_data(selected_symbol)
-            ext_features = load_external(selected_symbol)
             metrics, prediction, prediction30, model = train_and_predict(selected_symbol, df_raw)
             data_ok = True
         except Exception as e:
             st.error(f"Failed: {e}")
             data_ok = False
+
+        # Load external features separately (non-critical, can fail)
+        try:
+            ext_features = load_external(selected_symbol) if data_ok else {}
+        except Exception:
             ext_features = {}
 
     if not data_ok:

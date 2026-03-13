@@ -206,9 +206,11 @@ def fetch_market_breadth() -> dict:
     fallback = {"breadth_pct_above_ema50": 0.5}
     try:
         from src.constants import NIFTY50_SYMBOLS
-        symbols = [s for s in NIFTY50_SYMBOLS.keys() if not s.startswith("^")]
+        all_symbols = [s for s in NIFTY50_SYMBOLS.keys() if not s.startswith("^")]
+        # Use subset of 15 large-caps to reduce memory on cloud
+        symbols = all_symbols[:15]
         raw = yf.download(
-            symbols, period="90d", interval="1d",
+            symbols, period="60d", interval="1d",
             auto_adjust=True, progress=False, group_by="ticker",
         )
         above = counted = 0
