@@ -12,7 +12,6 @@ import warnings
 from xgboost import XGBRegressor
 from sklearn.preprocessing import RobustScaler
 from sklearn.linear_model import Ridge
-from sklearn.neural_network import MLPRegressor
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.metrics import mean_absolute_error, r2_score
 
@@ -38,11 +37,10 @@ except ImportError:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HORIZONS = [5, 10, 20, 30]
-MAX_FEATURES = 30
+MAX_FEATURES = 20
 PURGE_GAP = 30          # days gap between train/val (target looks 30d forward)
 RECENCY_DECAY = 0.999
 N_CV_SPLITS = 4
-MLP_LOOKBACK = 20       # days of returns to feed MLP as flattened sequence
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -84,19 +82,6 @@ def _drop_constant_features(X: np.ndarray,
     return X[:, mask], [f for f, m in zip(feature_names, mask) if m]
 
 
-def _build_mlp_sequence_features(df: pd.DataFrame,
-                                  lookback: int = MLP_LOOKBACK) -> np.ndarray:
-    """
-    Build flattened sequence features for MLP: last `lookback` days of
-    daily returns as a flat vector per row.
-    """
-    ret = df["returns_1d"].values if "returns_1d" in df.columns else df["close"].pct_change(1).values
-    n = len(ret)
-    seq = np.full((n, lookback), np.nan)
-    for i in range(lookback, n):
-        seq[i] = ret[i - lookback:i]
-    return seq
-
 
 # ── Model class ───────────────────────────────────────────────────────────────
 
@@ -120,7 +105,6 @@ class NiftyDailyPredictor:
         self.models = {}          # {horizon: {model_name: model}}
         self.meta_models = {}     # {horizon: Ridge}
         self.scalers = {}         # {horizon: RobustScaler}
-        self.mlp_scalers = {}     # {horizon: RobustScaler for MLP}
         self.selected_features = {}  # {horizon: list of feature names}
         self.active_features = DAILY_FEATURE_COLS.copy()
 
@@ -138,29 +122,18 @@ class NiftyDailyPredictor:
         """Create base model instances for a given horizon."""
         models = {
             "xgb": XGBRegressor(
-                n_estimators=300, learning_rate=0.03, max_depth=4,
+                n_estimators=150, learning_rate=0.05, max_depth=3,
                 subsample=0.7, colsample_bytree=0.6, min_child_weight=10,
                 reg_alpha=0.5, reg_lambda=3.0, gamma=0.05,
                 random_state=42 + horizon, tree_method="hist",
             ),
             "ridge": Ridge(alpha=100.0),
-            "mlp": MLPRegressor(
-                hidden_layer_sizes=(64, 32),
-                activation="relu",
-                solver="adam",
-                max_iter=200,
-                early_stopping=True,
-                validation_fraction=0.15,
-                random_state=42 + horizon,
-                learning_rate="adaptive",
-                learning_rate_init=0.001,
-            ),
         }
 
         if _LGBM_AVAILABLE:
             try:
                 models["lgbm"] = lgb.LGBMRegressor(
-                    n_estimators=300, learning_rate=0.03, max_depth=4,
+                    n_estimators=150, learning_rate=0.05, max_depth=3,
                     subsample=0.7, colsample_bytree=0.6,
                     min_child_weight=10, reg_alpha=0.5, reg_lambda=3.0,
                     random_state=77 + horizon, n_jobs=1, verbose=-1,
@@ -255,16 +228,6 @@ class NiftyDailyPredictor:
         X_scaled = scaler.fit_transform(X)
         self.scalers[horizon] = scaler
 
-        # Build MLP sequence features
-        mlp_seq = _build_mlp_sequence_features(clean)
-        # Mask: rows where sequence is fully available
-        mlp_valid = ~np.isnan(mlp_seq).any(axis=1)
-        mlp_scaler = RobustScaler()
-        mlp_seq_clean = mlp_seq.copy()
-        mlp_seq_clean[~mlp_valid] = 0.0
-        mlp_seq_scaled = mlp_scaler.fit_transform(mlp_seq_clean)
-        self.mlp_scalers[horizon] = mlp_scaler
-
         n = len(X_scaled)
         weights = _sample_weights(n)
 
@@ -287,27 +250,11 @@ class NiftyDailyPredictor:
 
             for name, model in base_models.items():
                 try:
-                    if name == "mlp":
-                        # MLP uses sequence features
-                        Xtr_mlp = mlp_seq_scaled[train_idx]
-                        Xval_mlp = mlp_seq_scaled[val_idx]
-                        # Only train on rows with valid sequences
-                        mlp_tr_valid = mlp_valid[train_idx]
-                        if mlp_tr_valid.sum() < 50:
-                            continue
-                        model.fit(Xtr_mlp[mlp_tr_valid],
-                                  ytr[mlp_tr_valid])
-                        p = model.predict(Xval_mlp)
-                    elif name in ("xgb",):
+                    if name in ("xgb", "lgbm"):
                         model.fit(Xtr, ytr, sample_weight=w_tr)
-                        p = model.predict(Xval)
-                    elif name == "lgbm":
-                        model.fit(Xtr, ytr, sample_weight=w_tr)
-                        p = model.predict(Xval)
                     else:
-                        # Ridge etc.
-                        model.fit(Xtr, ytr, sample_weight=w_tr)
-                        p = model.predict(Xval)
+                        model.fit(Xtr, ytr)
+                    p = model.predict(Xval)
 
                     oof_preds[name][val_idx] = p
                     val_preds_list.append(p)
@@ -372,15 +319,10 @@ class NiftyDailyPredictor:
         # ── Final fit on all data ─────────────────────────────────────────
         for name, model in base_models.items():
             try:
-                if name == "mlp":
-                    valid_mask = mlp_valid
-                    if valid_mask.sum() >= 50:
-                        model.fit(mlp_seq_scaled[valid_mask],
-                                  y[valid_mask])
-                elif name in ("xgb", "lgbm"):
+                if name in ("xgb", "lgbm"):
                     model.fit(X_scaled, y, sample_weight=weights)
                 else:
-                    model.fit(X_scaled, y, sample_weight=weights)
+                    model.fit(X_scaled, y)
             except Exception:
                 continue
 
@@ -404,10 +346,7 @@ class NiftyDailyPredictor:
         all_preds_is = []
         for name, model in base_models.items():
             try:
-                if name == "mlp":
-                    all_preds_is.append(model.predict(mlp_seq_scaled))
-                else:
-                    all_preds_is.append(model.predict(X_scaled))
+                all_preds_is.append(model.predict(X_scaled))
             except Exception:
                 continue
 
@@ -518,25 +457,12 @@ class NiftyDailyPredictor:
 
         X_scaled = scaler.transform(latest.values)
 
-        # MLP sequence features
-        mlp_seq = _build_mlp_sequence_features(df)
-        mlp_scaler = self.mlp_scalers.get(horizon)
-        if mlp_scaler is not None:
-            last_seq = mlp_seq[[-1]]
-            last_seq = np.nan_to_num(last_seq, nan=0.0)
-            mlp_scaled = mlp_scaler.transform(last_seq)
-        else:
-            mlp_scaled = np.zeros((1, MLP_LOOKBACK))
-
         # Base model predictions
         base_preds = {}
         base_models = self.models[horizon]
         for name, model in base_models.items():
             try:
-                if name == "mlp":
-                    base_preds[name] = float(model.predict(mlp_scaled)[0])
-                else:
-                    base_preds[name] = float(model.predict(X_scaled)[0])
+                base_preds[name] = float(model.predict(X_scaled)[0])
             except Exception:
                 continue
 

@@ -384,15 +384,24 @@ with tab_intraday:
 #  TAB 2: 30-DAY FORECAST
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_daily:
-    with st.spinner("Training 30-day forecast model..."):
-        try:
-            dm, dm_metrics = get_daily_model()
-            dm_pred = dm.predict()
-            daily_ok = True
-        except Exception as e:
-            st.error(f"Daily model failed: {e}")
-            st.caption(f"Details: {e}")
-            daily_ok = False
+    daily_ok = False
+
+    if "daily_model_result" not in st.session_state:
+        st.markdown("### 30-Day Nifty 50 Forecast")
+        st.caption("Trains a stacked ensemble on 2 years of daily data with global macro + sentiment features.")
+        if st.button("Generate 30-Day Forecast", type="primary"):
+            with st.spinner("Fetching data & training model (this may take 1-2 minutes)..."):
+                try:
+                    dm, dm_metrics = get_daily_model()
+                    dm_pred = dm.predict()
+                    st.session_state["daily_model_result"] = (dm_metrics, dm_pred)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Daily model failed: {e}")
+
+    if "daily_model_result" in st.session_state:
+        dm_metrics, dm_pred = st.session_state["daily_model_result"]
+        daily_ok = dm_pred is not None
 
     if daily_ok:
         cur_price = dm_pred["current_price"]
