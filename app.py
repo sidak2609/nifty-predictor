@@ -264,7 +264,8 @@ with st.spinner(f"Loading data and training model for {selected_symbol}…"):
         metrics, prediction = train_and_predict(selected_symbol, df)
         data_ok = True
     except Exception as e:
-        st.error(f"Failed to load data: {e}")
+        st.error(f"Failed to load data for {selected_symbol}: {e}")
+        st.info("This can happen when Yahoo Finance temporarily doesn't have data for this symbol. Try selecting a different stock or click 'Force Retrain' in the sidebar.")
         data_ok = False
 
 if not data_ok:

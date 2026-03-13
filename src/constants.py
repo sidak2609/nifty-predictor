@@ -42,14 +42,12 @@ NIFTY50_SYMBOLS = {
     "SHRIRAMFIN.NS": "Shriram Finance",
     "SUNPHARMA.NS":  "Sun Pharma",
     "TATACONSUM.NS": "Tata Consumer",
-    "TATAMOTORS.NS": "Tata Motors",
     "TATASTEEL.NS":  "Tata Steel",
     "TCS.NS":        "TCS",
     "TECHM.NS":      "Tech Mahindra",
     "TITAN.NS":      "Titan",
     "ULTRACEMCO.NS": "UltraTech Cement",
     "WIPRO.NS":      "Wipro",
-    "ZOMATO.NS":     "Zomato",
 }
 
 NIFTY_INDEX = "^NSEI"
