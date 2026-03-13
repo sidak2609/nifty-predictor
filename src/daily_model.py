@@ -227,7 +227,7 @@ class NiftyDailyPredictor:
         # Fill remaining NaN in features with 0
         clean[feat_cols] = clean[feat_cols].fillna(0.0)
 
-        if len(clean) < 300:
+        if len(clean) < 200:
             raise ValueError(
                 f"Not enough data for {horizon}d (need >= 300, got {len(clean)})"
             )

@@ -110,7 +110,7 @@ def _kaufman_efficiency_ratio(close: pd.Series, period: int = 20) -> pd.Series:
 
 # ── Global market historical features ────────────────────────────────────────
 
-def _fetch_global_daily(period: str = "5y") -> pd.DataFrame:
+def _fetch_global_daily(period: str = "2y") -> pd.DataFrame:
     """
     Fetch historical daily data for global tickers and compute
     multi-day returns and level features.
@@ -290,7 +290,7 @@ def engineer_daily_features(df: pd.DataFrame) -> pd.DataFrame:
 # ── Master fetch + prepare ────────────────────────────────────────────────────
 
 def fetch_and_prepare_daily(symbol: str = NIFTY_SYMBOL,
-                            period: str = "5y") -> pd.DataFrame:
+                            period: str = "2y") -> pd.DataFrame:
     """
     End-to-end pipeline:
     1. Fetch 5 years of daily OHLCV for Nifty 50.

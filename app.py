@@ -384,180 +384,170 @@ with tab_intraday:
 #  TAB 2: 30-DAY FORECAST
 # ═══════════════════════════════════════════════════════════════════════════
 with tab_daily:
-    with st.spinner("Training 30-day forecast model (5yr data + sentiment)..."):
+    with st.spinner("Training 30-day forecast model..."):
         try:
             dm, dm_metrics = get_daily_model()
             dm_pred = dm.predict()
             daily_ok = True
         except Exception as e:
             st.error(f"Daily model failed: {e}")
+            st.caption(f"Details: {e}")
             daily_ok = False
 
-    if not daily_ok:
-        st.stop()
+    if daily_ok:
+        cur_price = dm_pred["current_price"]
 
-    cur_price = dm_pred["current_price"]
+        # ── Headline predictions ──────────────────────────────────────────
+        st.markdown("### Price Forecast")
+        h1, h2, h3, h4 = st.columns(4)
+        for col, horizon, label in [
+            (h1, "5d", "5 Days"), (h2, "10d", "10 Days"),
+            (h3, "20d", "20 Days"), (h4, "30d", "30 Days"),
+        ]:
+            p = dm_pred[horizon]
+            d = p["direction"]
+            color = "#00E676" if d == "UP" else "#FF5252"
+            with col:
+                st.metric(label, f"₹{p['price']:,.2f}", f"{p['pct_change']:+.2f}%")
+                st.markdown(f"<div style='font-size:0.8rem;color:{color};font-weight:700'>"
+                    f"{'▲' if d=='UP' else '▼'} {d} ({p['confidence']:.0f}% conf)</div>",
+                    unsafe_allow_html=True)
+                st.caption(f"Range: ₹{p['range_low']:,.0f} — ₹{p['range_high']:,.0f}")
 
-    # ── Headline predictions ──────────────────────────────────────────────
-    st.markdown("### Price Forecast")
-    h1, h2, h3, h4 = st.columns(4)
-    for col, horizon, label in [
-        (h1, "5d", "5 Days"), (h2, "10d", "10 Days"),
-        (h3, "20d", "20 Days"), (h4, "30d", "30 Days"),
-    ]:
-        p = dm_pred[horizon]
-        d = p["direction"]
-        color = "#00E676" if d == "UP" else "#FF5252"
-        with col:
-            st.metric(label, f"₹{p['price']:,.2f}", f"{p['pct_change']:+.2f}%")
-            st.markdown(f"<div style='font-size:0.8rem;color:{color};font-weight:700'>"
-                f"{'▲' if d=='UP' else '▼'} {d} ({p['confidence']:.0f}% conf)</div>",
-                unsafe_allow_html=True)
-            st.caption(f"Range: ₹{p['range_low']:,.0f} — ₹{p['range_high']:,.0f}")
+        st.divider()
 
-    st.divider()
+        # ── Forecast chart with confidence bands ──────────────────────────
+        st.markdown("### Forecast Visualization")
 
-    # ── Forecast chart with confidence bands ──────────────────────────────
-    st.markdown("### Forecast Visualization")
+        try:
+            import yfinance as yf
+            hist_daily = yf.Ticker("^NSEI").history(period="6mo", interval="1d", auto_adjust=True)
+            hist_close = hist_daily["Close"].dropna().tail(90)
+        except Exception:
+            hist_close = pd.Series(dtype=float)
 
-    # Historical price (last 90 days)
-    try:
-        import yfinance as yf
-        hist_daily = yf.Ticker("^NSEI").history(period="6mo", interval="1d", auto_adjust=True)
-        hist_close = hist_daily["Close"].dropna().tail(90)
-    except Exception:
-        hist_close = pd.Series(dtype=float)
+        fig_fc = go.Figure()
 
-    fig_fc = go.Figure()
+        if not hist_close.empty:
+            fig_fc.add_trace(go.Scatter(
+                x=hist_close.index, y=hist_close.values,
+                line=dict(color="#40C4FF", width=2), name="Historical",
+            ))
 
-    # Historical line
-    if not hist_close.empty:
+        today = datetime.now()
+        fc_dates = [today + timedelta(days=d) for d in [5, 10, 20, 30]]
+        fc_prices = [dm_pred[h]["price"] for h in ["5d", "10d", "20d", "30d"]]
+        fc_lows   = [dm_pred[h]["range_low"] for h in ["5d", "10d", "20d", "30d"]]
+        fc_highs  = [dm_pred[h]["range_high"] for h in ["5d", "10d", "20d", "30d"]]
+
+        all_dates  = [today] + fc_dates
+        all_prices = [cur_price] + fc_prices
+        all_lows   = [cur_price] + fc_lows
+        all_highs  = [cur_price] + fc_highs
+
         fig_fc.add_trace(go.Scatter(
-            x=hist_close.index, y=hist_close.values,
-            line=dict(color="#40C4FF", width=2), name="Historical",
+            x=all_dates + all_dates[::-1],
+            y=all_highs + all_lows[::-1],
+            fill="toself", fillcolor="rgba(64, 196, 255, 0.15)",
+            line=dict(color="rgba(0,0,0,0)"), name="90% Confidence",
         ))
 
-    # Forecast points + confidence bands
-    today = datetime.now()
-    fc_dates = [today + timedelta(days=d) for d in [5, 10, 20, 30]]
-    fc_prices = [dm_pred[h]["price"] for h in ["5d", "10d", "20d", "30d"]]
-    fc_lows   = [dm_pred[h]["range_low"] for h in ["5d", "10d", "20d", "30d"]]
-    fc_highs  = [dm_pred[h]["range_high"] for h in ["5d", "10d", "20d", "30d"]]
-    fc_dirs   = [dm_pred[h]["direction"] for h in ["5d", "10d", "20d", "30d"]]
+        fc_color = "#00E676" if fc_prices[-1] > cur_price else "#FF5252"
+        fig_fc.add_trace(go.Scatter(
+            x=all_dates, y=all_prices,
+            line=dict(color=fc_color, width=3, dash="dash"), name="Forecast",
+            mode="lines+markers", marker=dict(size=10),
+        ))
 
-    # Add current price as anchor
-    all_dates  = [today] + fc_dates
-    all_prices = [cur_price] + fc_prices
-    all_lows   = [cur_price] + fc_lows
-    all_highs  = [cur_price] + fc_highs
+        fig_fc.add_trace(go.Scatter(
+            x=[today], y=[cur_price], mode="markers+text",
+            marker=dict(size=14, color="#FFD740", symbol="star"),
+            text=[f"₹{cur_price:,.0f}"], textposition="top center",
+            textfont=dict(color="#FFD740", size=12), name="Current",
+        ))
 
-    # Confidence band
-    fig_fc.add_trace(go.Scatter(
-        x=all_dates + all_dates[::-1],
-        y=all_highs + all_lows[::-1],
-        fill="toself", fillcolor="rgba(64, 196, 255, 0.15)",
-        line=dict(color="rgba(0,0,0,0)"), name="90% Confidence",
-    ))
+        for i, (d, p, h) in enumerate(zip(fc_dates, fc_prices, ["5d","10d","20d","30d"])):
+            direction = dm_pred[h]["direction"]
+            color = "#00E676" if direction == "UP" else "#FF5252"
+            fig_fc.add_annotation(x=d, y=p, text=f"₹{p:,.0f}<br>{h}",
+                showarrow=True, arrowhead=2, arrowcolor=color,
+                font=dict(color=color, size=11), bgcolor="#0E1117", bordercolor=color)
 
-    # Forecast line
-    fc_color = "#00E676" if fc_prices[-1] > cur_price else "#FF5252"
-    fig_fc.add_trace(go.Scatter(
-        x=all_dates, y=all_prices,
-        line=dict(color=fc_color, width=3, dash="dash"), name="Forecast",
-        mode="lines+markers", marker=dict(size=10),
-    ))
+        fig_fc.update_layout(
+            height=450, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+            font=dict(color="#FAFAFA"), margin=dict(t=30, b=10, l=10, r=10),
+            legend=dict(orientation="h", y=1.02, x=0),
+            yaxis_title="Nifty 50",
+        )
+        fig_fc.update_xaxes(gridcolor="#2D3139")
+        fig_fc.update_yaxes(gridcolor="#2D3139")
+        st.plotly_chart(fig_fc, use_container_width=True)
 
-    # Current price marker
-    fig_fc.add_trace(go.Scatter(
-        x=[today], y=[cur_price], mode="markers+text",
-        marker=dict(size=14, color="#FFD740", symbol="star"),
-        text=[f"₹{cur_price:,.0f}"], textposition="top center",
-        textfont=dict(color="#FFD740", size=12), name="Current",
-    ))
+        # ── Detailed table ────────────────────────────────────────────────
+        st.markdown("### Detailed Forecast")
+        rows = []
+        for h, label in [("5d","5 Days"),("10d","10 Days"),("20d","20 Days"),("30d","30 Days")]:
+            p = dm_pred[h]
+            rows.append({
+                "Horizon": label,
+                "Price": f"₹{p['price']:,.2f}",
+                "Change": f"{p['pct_change']:+.2f}%",
+                "Direction": p["direction"],
+                "Low (P5)": f"₹{p['range_low']:,.0f}",
+                "High (P95)": f"₹{p['range_high']:,.0f}",
+                "Confidence": f"{p['confidence']:.0f}%",
+            })
+        fc_df = pd.DataFrame(rows)
+        def _fc_dir_color(val):
+            if val == "UP": return "color: #00E676; font-weight:bold"
+            return "color: #FF5252; font-weight:bold"
+        st.dataframe(fc_df.style.map(_fc_dir_color, subset=["Direction"]),
+                     use_container_width=True, hide_index=True)
 
-    # Horizon labels
-    for i, (d, p, h) in enumerate(zip(fc_dates, fc_prices, ["5d","10d","20d","30d"])):
-        direction = dm_pred[h]["direction"]
-        color = "#00E676" if direction == "UP" else "#FF5252"
-        fig_fc.add_annotation(x=d, y=p, text=f"₹{p:,.0f}<br>{h}",
-            showarrow=True, arrowhead=2, arrowcolor=color,
-            font=dict(color=color, size=11), bgcolor="#0E1117", bordercolor=color)
+        # ── Model metrics ─────────────────────────────────────────────────
+        st.markdown("### Daily Model Performance")
+        dm1, dm2, dm3, dm4 = st.columns(4)
+        for col, h, label in [(dm1,"5d","5-Day"),(dm2,"10d","10-Day"),(dm3,"20d","20-Day"),(dm4,"30d","30-Day")]:
+            m = dm_metrics.get(h, {})
+            with col:
+                st.metric(f"{label} MAE", f"{m.get('mae', 0)*100:.2f}%")
+                st.caption(f"R²: {m.get('r2', 0):.3f}")
+                st.caption(f"Dir acc: {m.get('dir_acc', 0):.1f}%")
+                st.caption(f"Samples: {m.get('n_samples', 0):,}")
 
-    fig_fc.update_layout(
-        height=450, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
-        font=dict(color="#FAFAFA"), margin=dict(t=30, b=10, l=10, r=10),
-        legend=dict(orientation="h", y=1.02, x=0),
-        yaxis_title="Nifty 50",
-    )
-    fig_fc.update_xaxes(gridcolor="#2D3139")
-    fig_fc.update_yaxes(gridcolor="#2D3139")
-    st.plotly_chart(fig_fc, use_container_width=True)
+        # ── Sentiment used ────────────────────────────────────────────────
+        st.markdown("### Sentiment Inputs")
+        s1, s2, s3 = st.columns(3)
+        try:
+            from src.sentiment import fetch_news_sentiment, fetch_reddit_sentiment, fetch_market_breadth
+            news = fetch_news_sentiment("Nifty India stock market")
+            reddit = fetch_reddit_sentiment()
+            breadth = fetch_market_breadth()
+            ns = news.get("news_sentiment", 0)
+            rs = reddit.get("reddit_sentiment", 0)
+            br = breadth.get("breadth_pct_above_ema50", 0.5) * 100
 
-    # ── Detailed table ────────────────────────────────────────────────────
-    st.markdown("### Detailed Forecast")
-    rows = []
-    for h, label in [("5d","5 Days"),("10d","10 Days"),("20d","20 Days"),("30d","30 Days")]:
-        p = dm_pred[h]
-        rows.append({
-            "Horizon": label,
-            "Price": f"₹{p['price']:,.2f}",
-            "Change": f"{p['pct_change']:+.2f}%",
-            "Direction": p["direction"],
-            "Low (P5)": f"₹{p['range_low']:,.0f}",
-            "High (P95)": f"₹{p['range_high']:,.0f}",
-            "Confidence": f"{p['confidence']:.0f}%",
-        })
-    fc_df = pd.DataFrame(rows)
-    def _fc_dir_color(val):
-        if val == "UP": return "color: #00E676; font-weight:bold"
-        return "color: #FF5252; font-weight:bold"
-    st.dataframe(fc_df.style.map(_fc_dir_color, subset=["Direction"]),
-                 use_container_width=True, hide_index=True)
+            nc = "#00E676" if ns > 0.1 else ("#FF5252" if ns < -0.1 else "#FFD740")
+            rc = "#00E676" if rs > 0.1 else ("#FF5252" if rs < -0.1 else "#FFD740")
+            bc = "#00E676" if br > 60 else ("#FF5252" if br < 40 else "#FFD740")
 
-    # ── Model metrics ─────────────────────────────────────────────────────
-    st.markdown("### Daily Model Performance")
-    dm1, dm2, dm3, dm4 = st.columns(4)
-    for col, h, label in [(dm1,"5d","5-Day"),(dm2,"10d","10-Day"),(dm3,"20d","20-Day"),(dm4,"30d","30-Day")]:
-        m = dm_metrics.get(h, {})
-        with col:
-            st.metric(f"{label} MAE", f"{m.get('mae', 0)*100:.2f}%")
-            st.caption(f"R²: {m.get('r2', 0):.3f}")
-            st.caption(f"Dir acc: {m.get('dir_acc', 0):.1f}%")
-            st.caption(f"Samples: {m.get('n_samples', 0):,}")
-
-    # ── Sentiment used ────────────────────────────────────────────────────
-    st.markdown("### Sentiment Inputs")
-    s1, s2, s3 = st.columns(3)
-    try:
-        from src.sentiment import fetch_news_sentiment, fetch_reddit_sentiment, fetch_market_breadth
-        news = fetch_news_sentiment("Nifty India stock market")
-        reddit = fetch_reddit_sentiment()
-        breadth = fetch_market_breadth()
-        ns = news.get("news_sentiment", 0)
-        rs = reddit.get("reddit_sentiment", 0)
-        br = breadth.get("breadth_pct_above_ema50", 0.5) * 100
-
-        nc = "#00E676" if ns > 0.1 else ("#FF5252" if ns < -0.1 else "#FFD740")
-        rc = "#00E676" if rs > 0.1 else ("#FF5252" if rs < -0.1 else "#FFD740")
-        bc = "#00E676" if br > 60 else ("#FF5252" if br < 40 else "#FFD740")
-
-        s1.markdown(f"<div style='text-align:center'>"
-            f"<div style='color:#AAB4C8'>📰 News Sentiment</div>"
-            f"<div style='font-size:1.5rem;font-weight:700;color:{nc}'>{ns:+.2f}</div>"
-            f"<div style='color:#666'>{news.get('news_count',0)} articles</div></div>",
-            unsafe_allow_html=True)
-        s2.markdown(f"<div style='text-align:center'>"
-            f"<div style='color:#AAB4C8'>💬 Reddit Sentiment</div>"
-            f"<div style='font-size:1.5rem;font-weight:700;color:{rc}'>{rs:+.2f}</div>"
-            f"<div style='color:#666'>{reddit.get('reddit_count',0)} posts</div></div>",
-            unsafe_allow_html=True)
-        s3.markdown(f"<div style='text-align:center'>"
-            f"<div style='color:#AAB4C8'>📊 Market Breadth</div>"
-            f"<div style='font-size:1.5rem;font-weight:700;color:{bc}'>{br:.0f}%</div>"
-            f"<div style='color:#666'>Nifty50 above EMA50</div></div>",
-            unsafe_allow_html=True)
-    except Exception:
-        st.caption("Sentiment data unavailable")
+            s1.markdown(f"<div style='text-align:center'>"
+                f"<div style='color:#AAB4C8'>📰 News Sentiment</div>"
+                f"<div style='font-size:1.5rem;font-weight:700;color:{nc}'>{ns:+.2f}</div>"
+                f"<div style='color:#666'>{news.get('news_count',0)} articles</div></div>",
+                unsafe_allow_html=True)
+            s2.markdown(f"<div style='text-align:center'>"
+                f"<div style='color:#AAB4C8'>💬 Reddit Sentiment</div>"
+                f"<div style='font-size:1.5rem;font-weight:700;color:{rc}'>{rs:+.2f}</div>"
+                f"<div style='color:#666'>{reddit.get('reddit_count',0)} posts</div></div>",
+                unsafe_allow_html=True)
+            s3.markdown(f"<div style='text-align:center'>"
+                f"<div style='color:#AAB4C8'>📊 Market Breadth</div>"
+                f"<div style='font-size:1.5rem;font-weight:700;color:{bc}'>{br:.0f}%</div>"
+                f"<div style='color:#666'>Nifty50 above EMA50</div></div>",
+                unsafe_allow_html=True)
+        except Exception:
+            st.caption("Sentiment data unavailable")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────
