@@ -22,12 +22,19 @@ except ImportError:
     _LGBM_AVAILABLE = False
 
 N_ENSEMBLE = 3          # XGBoost models per horizon
-ROLLING_DAYS = 30       # train on most recent N days only
+ROLLING_DAYS = 50       # train on most recent N days (50 = enough for bias correction)
 
 
 def _rolling_window(df: pd.DataFrame, days: int = ROLLING_DAYS) -> pd.DataFrame:
     cutoff = df.index.max() - pd.Timedelta(days=days)
     return df[df.index >= cutoff]
+
+
+def _drop_constant_features(X: np.ndarray, feature_names: list) -> tuple[np.ndarray, list]:
+    """Drop features that are constant (std=0) — e.g. NSE API fallback zeros."""
+    stds = X.std(axis=0)
+    mask = stds > 1e-8
+    return X[:, mask], [f for f, m in zip(feature_names, mask) if m]
 
 
 class NiftyPredictor:
@@ -111,6 +118,7 @@ class NiftyPredictor:
         self._bias_3: float = 0.0
         self._q10: float = -0.002
         self._q90: float = +0.002
+        self._active_features: list = FEATURE_COLS   # subset after dropping constants
 
     # ── Internal helpers ───────────────────────────────────────────────────
     def _train_mlp(self, df: pd.DataFrame):
@@ -131,13 +139,13 @@ class NiftyPredictor:
     def _train_session_models(self, df: pd.DataFrame):
         if "session" not in df.columns:
             return
-        clean = df[FEATURE_COLS + ["target_return", "session"]].dropna()
+        clean = df[self._active_features + ["target_return", "session"]].dropna()
         for session_name, model in self.session_models.items():
             subset = clean[clean["session"] == session_name]
             if len(subset) < 50:
                 continue
             X = self.session_scalers[session_name].fit_transform(
-                subset[FEATURE_COLS].values
+                subset[self._active_features].values
             )
             try:
                 model.fit(X, subset["target_return"].values)
@@ -147,7 +155,6 @@ class NiftyPredictor:
 
     # ── Train ──────────────────────────────────────────────────────────────
     def train(self, df: pd.DataFrame) -> dict:
-        # Rolling window: most recent 30 days
         df = _rolling_window(df, days=ROLLING_DAYS)
 
         required = FEATURE_COLS + ["target_return", "target_return_3", "target_direction", "close"]
@@ -155,7 +162,12 @@ class NiftyPredictor:
         if len(clean) < 100:
             raise ValueError(f"Not enough data (need ≥100 rows, got {len(clean)})")
 
-        X      = clean[FEATURE_COLS].values
+        # Drop constant features (e.g. NSE API fallback zeros)
+        X_raw, self._active_features = _drop_constant_features(
+            clean[FEATURE_COLS].values, FEATURE_COLS
+        )
+
+        X      = X_raw
         y_ret  = clean["target_return"].values
         y_ret3 = clean["target_return_3"].values
         y_dir  = clean["target_direction"].values
@@ -229,18 +241,23 @@ class NiftyPredictor:
         actual_prices = prices * (1 + y_ret)
         mape = float(np.mean(np.abs(pred_prices - actual_prices) / actual_prices) * 100)
 
-        # Feature importance (average XGB ensemble)
+        # Feature importance (average XGB ensemble, active features only)
         avg_imp = np.mean([r.feature_importances_ for r in self.regressors], axis=0)
-        self.feature_importance = pd.Series(avg_imp, index=FEATURE_COLS).sort_values(ascending=False)
+        self.feature_importance = pd.Series(
+            avg_imp, index=self._active_features
+        ).sort_values(ascending=False)
 
+        dropped = len(FEATURE_COLS) - len(self._active_features)
         self.metrics = {
-            "mape":            round(mape, 3),
-            "dir_acc":         round(float(np.mean(dir_accs)), 1),
-            "n_samples":       len(clean),
-            "bias_corr":       round(self._bias * 100, 4),
-            "lgbm":            self.lgbm_regressor is not None,
-            "mlp":             self.mlp_trained,
+            "mape":             round(mape, 3),
+            "dir_acc":          round(float(np.mean(dir_accs)), 1),
+            "n_samples":        len(clean),
+            "bias_corr":        round(self._bias * 100, 4),
+            "lgbm":             self.lgbm_regressor is not None,
+            "mlp":              self.mlp_trained,
             "sessions_trained": sorted(self.session_trained),
+            "active_features":  len(self._active_features),
+            "dropped_features": dropped,
         }
         return self.metrics
 
@@ -248,7 +265,7 @@ class NiftyPredictor:
     def predict(self, df: pd.DataFrame) -> dict | None:
         if not self.is_trained:
             return None
-        clean = df[FEATURE_COLS].dropna()
+        clean = df[self._active_features].dropna()
         if clean.empty:
             return None
 
@@ -277,11 +294,11 @@ class NiftyPredictor:
 
         # Blend session model (20% weight)
         if "session" in df.columns:
-            cur_session = df["session"].iloc[-1]
+            cur_session = df["session"].dropna().iloc[-1]
             if cur_session in self.session_trained:
                 try:
-                    X_s    = self.session_scalers[cur_session].transform(latest.values)
-                    s_ret  = float(self.session_models[cur_session].predict(X_s)[0])
+                    X_s   = self.session_scalers[cur_session].transform(latest.values)
+                    s_ret = float(self.session_models[cur_session].predict(X_s)[0])
                     corrected_return = 0.80 * corrected_return + 0.20 * s_ret
                 except Exception:
                     pass
@@ -317,7 +334,7 @@ class NiftyPredictor:
     def predict_30min(self, df: pd.DataFrame) -> dict | None:
         if not self.is_trained:
             return None
-        clean = df[FEATURE_COLS].dropna()
+        clean = df[self._active_features].dropna()
         if clean.empty:
             return None
         latest   = clean.iloc[[-1]]

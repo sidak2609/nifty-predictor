@@ -12,7 +12,12 @@ from src.constants import NIFTY50_SYMBOLS, NIFTY_INDEX, MIN_CONFIDENCE, HIGH_CON
 from src.data_fetcher import fetch_ohlcv, get_market_status
 from src.features import engineer_features, engineer_lag_features
 from src.model import NiftyPredictor
-from src.sentiment import get_all_external_features, merge_into_df
+from src.sentiment import (
+    get_all_external_features,
+    merge_into_df,
+    fetch_global_markets_historical,
+    merge_global_historical,
+)
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -47,10 +52,17 @@ def _set_predictor(symbol, model):
 
 # ── Data pipeline ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
+def load_global_hist() -> pd.DataFrame:
+    """Historical daily global market data — varies day-to-day so model can learn from it."""
+    return fetch_global_markets_historical(days=70)
+
+@st.cache_data(ttl=600, show_spinner=False)
 def load_data(symbol: str) -> pd.DataFrame:
-    raw = fetch_ohlcv(symbol, days=55)
-    df  = engineer_features(raw)
-    df  = engineer_lag_features(df)
+    raw      = fetch_ohlcv(symbol, days=55)
+    df       = engineer_features(raw)
+    df       = engineer_lag_features(df)
+    hist_ext = load_global_hist()
+    df       = merge_global_historical(df, hist_ext)
     return df
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -153,15 +165,13 @@ def build_chart(df: pd.DataFrame, prediction, symbol: str):
 # ── All-stocks scan ───────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def scan_all_stocks() -> list[dict]:
-    shared_ext = get_all_external_features("^NSEI")
     results = []
     for sym, name in NIFTY50_SYMBOLS.items():
         try:
-            df_raw = load_data(sym)
-            df     = merge_into_df(df_raw, shared_ext)
-            model  = NiftyPredictor()
-            model.train(df)
-            pred = model.predict(df)
+            df_stock = load_data(sym)   # already has historical global features
+            model    = NiftyPredictor()
+            model.train(df_stock)
+            pred = model.predict(df_stock)
             if pred and pred["confidence"] >= MIN_CONFIDENCE * 100:
                 results.append({
                     "Symbol":     sym.replace(".NS", "").replace("^", ""),
@@ -224,10 +234,11 @@ st.title(f"📈  {selected_name}  ({selected_symbol.replace('.NS','').replace('^
 # ── Load data + sentiment + train ─────────────────────────────────────────
 with st.spinner("Loading data, sentiment & training model…"):
     try:
-        df_raw      = load_data(selected_symbol)
-        ext_features = load_external(selected_symbol)
-        df          = merge_into_df(df_raw, ext_features)
-        metrics, prediction, prediction30, model = train_and_predict(selected_symbol, df)
+        df_raw       = load_data(selected_symbol)   # already has historical global market cols
+        ext_features = load_external(selected_symbol)  # live values — for display only
+        # df_raw already has global market features merged in by date (day-to-day variance)
+        # We do NOT broadcast today's single live value over all rows (that causes std=0 → dropped)
+        metrics, prediction, prediction30, model = train_and_predict(selected_symbol, df_raw)
         data_ok = True
     except Exception as e:
         st.error(f"Failed to load data for {selected_symbol}: {e}")
@@ -350,7 +361,7 @@ if ext_features:
 st.divider()
 
 # ── Chart ─────────────────────────────────────────────────────────────────
-chart = build_chart(df_raw, prediction, selected_symbol)
+chart = build_chart(df_raw, prediction, selected_symbol)  # df_raw now includes global features
 st.plotly_chart(chart, use_container_width=True)
 
 # ── Confidence warning ────────────────────────────────────────────────────
@@ -400,10 +411,10 @@ if model and not model.feature_importance.empty:
 
 # ── Raw data ──────────────────────────────────────────────────────────────
 with st.expander("Raw data (last 30 candles)"):
-    base_cols = ["open", "high", "low", "close", "volume", "rsi14", "macd", "vwap"]
-    extra_cols = [c for c in ["session", "adx", "pcr", "fii_net", "breadth_pct_above_ema50"]
-                  if c in df.columns]
-    display_df = df[base_cols + extra_cols].tail(30).copy()
+    base_cols  = ["open", "high", "low", "close", "volume", "rsi14", "macd", "vwap"]
+    extra_cols = [c for c in ["session", "adx", "sp500_change", "india_vix", "usdinr"]
+                  if c in df_raw.columns]
+    display_df = df_raw[base_cols + extra_cols].tail(30).copy()
     display_df.index = display_df.index.strftime("%Y-%m-%d %H:%M")
     st.dataframe(display_df.style.format(
         {c: "{:.2f}" for c in display_df.select_dtypes(float).columns}

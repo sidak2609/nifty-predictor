@@ -201,20 +201,13 @@ FEATURE_COLS = [
     # Time
     "session_progress", "hour_sin",
     "is_open_rush", "is_close_rush", "is_lunch",
-    # Global market context
+    # Global market context (historical daily — varies day-to-day in training)
     "sp500_change", "nasdaq_change", "dow_change",
     "india_vix", "india_vix_change",
     "vix_level", "vix_change",
     "nikkei_change", "hangseng_change",
     "usdinr", "usdinr_change",
     "gold_change", "crude_change",
-    "news_sentiment", "news_count",
-    # Institutional flows (FII/DII)
-    "fii_net", "dii_net", "fii_dii_ratio",
-    # Options market (PCR)
-    "pcr", "pcr_signal",
-    # Social sentiment
-    "reddit_sentiment", "reddit_count",
-    # Market breadth
-    "breadth_pct_above_ema50",
+    # NOTE: news_sentiment, fii_net, dii_net, pcr, reddit_sentiment, breadth
+    # are point-in-time only (no historical API) → display panel only, not in model
 ]

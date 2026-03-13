@@ -280,6 +280,115 @@ def merge_into_df(df: pd.DataFrame, ext: dict) -> pd.DataFrame:
     return df
 
 
+# ── Historical global market data (for training) ───────────────────────────
+GLOBAL_MKT_FEATURE_COLS = [
+    "sp500_change", "nasdaq_change", "dow_change",
+    "india_vix", "india_vix_change",
+    "vix_level", "vix_change",
+    "nikkei_change", "hangseng_change",
+    "usdinr", "usdinr_change",
+    "gold_change", "crude_change",
+]
+
+_FALLBACK_GLOBAL = {
+    "sp500_change": 0.0, "nasdaq_change": 0.0, "dow_change": 0.0,
+    "india_vix": 15.0,   "india_vix_change": 0.0,
+    "vix_level": 20.0,   "vix_change": 0.0,
+    "nikkei_change": 0.0, "hangseng_change": 0.0,
+    "usdinr": 84.0,       "usdinr_change": 0.0,
+    "gold_change": 0.0,   "crude_change": 0.0,
+}
+
+
+def fetch_global_markets_historical(days: int = 70) -> pd.DataFrame:
+    """
+    Return a date-indexed DataFrame of daily global market features.
+    Each row is one trading day with pct-change and level values.
+    Used for training so the model sees day-to-day variation (not a constant broadcast).
+    """
+    try:
+        symbols = list(GLOBAL_TICKERS.values())
+        raw = yf.download(
+            symbols, period=f"{days + 10}d", interval="1d",
+            auto_adjust=True, progress=False, group_by="ticker",
+        )
+        if raw.empty:
+            return pd.DataFrame()
+
+        result = pd.DataFrame(index=raw.index)
+        lvl0 = raw.columns.get_level_values(0)
+
+        for name, sym in GLOBAL_TICKERS.items():
+            if name == "sgx_nifty":
+                continue  # skip — same as ^NSEI, redundant
+            try:
+                if sym not in lvl0:
+                    continue
+                close = raw[sym]["Close"].dropna()
+                pct   = close.pct_change() * 100
+
+                if name == "india_vix":
+                    result["india_vix"]        = close
+                    result["india_vix_change"] = pct
+                elif name == "vix":
+                    result["vix_level"] = close
+                    result["vix_change"] = pct
+                elif name == "usdinr":
+                    result["usdinr"]        = close
+                    result["usdinr_change"] = pct
+                else:
+                    result[f"{name}_change"] = pct
+            except Exception:
+                pass
+
+        result = result.dropna(how="all")
+        # Shift by 1 day: use previous day's values for each training row
+        # (avoids look-ahead bias; Indian market reacts to prior-day global moves)
+        result = result.shift(1)
+        return result.iloc[days * -1:]   # keep only the requested window
+
+    except Exception:
+        return pd.DataFrame()
+
+
+def merge_global_historical(df: pd.DataFrame, hist: pd.DataFrame) -> pd.DataFrame:
+    """
+    Join daily global market data into an intraday DataFrame by date.
+    Each intraday row gets the previous trading day's global market values.
+    """
+    if hist.empty:
+        # Apply fallback constants so FEATURE_COLS columns exist
+        for col, val in _FALLBACK_GLOBAL.items():
+            df[col] = val
+        return df
+
+    df = df.copy()
+
+    # Normalise index timezones
+    df_dates = df.index.normalize()
+    if df.index.tzinfo is not None:
+        df_dates = df_dates.tz_localize(None)
+
+    hist_idx = hist.index.tz_localize(None) if hist.index.tzinfo is not None else hist.index
+
+    for col in hist.columns:
+        mapping = dict(zip(hist_idx, hist[col]))
+        df[col] = df_dates.map(mapping)
+
+    # Forward-fill missing dates (weekends, holidays)
+    for col in hist.columns:
+        df[col] = df[col].ffill()
+
+    # Fill any remaining NaN with fallback
+    for col, val in _FALLBACK_GLOBAL.items():
+        if col in df.columns:
+            df[col] = df[col].fillna(val)
+        else:
+            df[col] = val
+
+    return df
+
+
 # Feature names added by this module
 SENTIMENT_FEATURE_COLS = [
     "sp500_change", "nasdaq_change", "dow_change",
