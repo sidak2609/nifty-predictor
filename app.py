@@ -1,5 +1,4 @@
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
@@ -7,18 +6,6 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import pytz
-
-from src.constants import NIFTY50_SYMBOLS, NIFTY_INDEX, MIN_CONFIDENCE, HIGH_CONFIDENCE
-from src.data_fetcher import fetch_ohlcv, fetch_daily_ohlcv, get_market_status
-from src.features import engineer_features, engineer_lag_features, compute_daily_context, merge_daily_context
-from src.model import NiftyPredictor
-from src.daily_model import NiftyDailyPredictor
-from src.sentiment import (
-    get_all_external_features,
-    merge_into_df,
-    fetch_global_markets_historical,
-    merge_global_historical,
-)
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -44,65 +31,79 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── Session-state helpers ─────────────────────────────────────────────────
-def _get_predictor(symbol):
-    return st.session_state.get(f"model_{symbol}")
+# ── Lazy imports (avoid importing heavy modules at startup) ───────────────
+@st.cache_resource
+def _load_modules():
+    from src.constants import NIFTY50_SYMBOLS, NIFTY_INDEX, MIN_CONFIDENCE, HIGH_CONFIDENCE
+    from src.data_fetcher import fetch_ohlcv, fetch_daily_ohlcv, get_market_status
+    from src.features import engineer_features, engineer_lag_features, compute_daily_context, merge_daily_context
+    from src.model import NiftyPredictor
+    from src.daily_model import NiftyDailyPredictor
+    from src.sentiment import (
+        get_all_external_features, merge_into_df,
+        fetch_global_markets_historical, merge_global_historical,
+    )
+    return {
+        "NIFTY50_SYMBOLS": NIFTY50_SYMBOLS, "NIFTY_INDEX": NIFTY_INDEX,
+        "MIN_CONFIDENCE": MIN_CONFIDENCE, "HIGH_CONFIDENCE": HIGH_CONFIDENCE,
+        "fetch_ohlcv": fetch_ohlcv, "fetch_daily_ohlcv": fetch_daily_ohlcv,
+        "get_market_status": get_market_status,
+        "engineer_features": engineer_features, "engineer_lag_features": engineer_lag_features,
+        "compute_daily_context": compute_daily_context, "merge_daily_context": merge_daily_context,
+        "NiftyPredictor": NiftyPredictor, "NiftyDailyPredictor": NiftyDailyPredictor,
+        "get_all_external_features": get_all_external_features,
+        "fetch_global_markets_historical": fetch_global_markets_historical,
+        "merge_global_historical": merge_global_historical,
+    }
 
-def _set_predictor(symbol, model):
-    st.session_state[f"model_{symbol}"] = model
+M = _load_modules()
+NIFTY50_SYMBOLS = M["NIFTY50_SYMBOLS"]
 
 
-# ── Data pipeline (intraday) ─────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
-def load_global_hist() -> pd.DataFrame:
-    return fetch_global_markets_historical(days=70)
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_daily_ctx(symbol: str) -> pd.DataFrame:
-    daily = fetch_daily_ohlcv(symbol, period="1y")
-    if daily.empty:
-        return pd.DataFrame()
-    return compute_daily_context(daily)
-
+# ── Data pipeline ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def load_data(symbol: str) -> pd.DataFrame:
-    raw       = fetch_ohlcv(symbol, days=58)
-    df        = engineer_features(raw)
-    df        = engineer_lag_features(df)
-    hist_ext  = load_global_hist()
-    df        = merge_global_historical(df, hist_ext)
-    daily_ctx = load_daily_ctx(symbol)
-    df        = merge_daily_context(df, daily_ctx)
+    raw  = M["fetch_ohlcv"](symbol, days=58)
+    df   = M["engineer_features"](raw)
+    df   = M["engineer_lag_features"](df)
+    try:
+        hist = M["fetch_global_markets_historical"](days=70)
+        df   = M["merge_global_historical"](df, hist)
+    except Exception:
+        pass
+    try:
+        daily = M["fetch_daily_ohlcv"](symbol, period="1y")
+        if not daily.empty:
+            ctx = M["compute_daily_context"](daily)
+            df  = M["merge_daily_context"](df, ctx)
+    except Exception:
+        pass
     return df
 
 @st.cache_data(ttl=600, show_spinner=False)
 def load_external(symbol: str) -> dict:
-    return get_all_external_features(symbol)
+    try:
+        return M["get_all_external_features"](symbol)
+    except Exception:
+        return {}
+
 
 def train_and_predict(symbol: str, df: pd.DataFrame):
-    model    = _get_predictor(symbol)
-    now      = time.time()
-    last_key = f"last_train_{symbol}"
-    should_retrain = model is None or (now - st.session_state.get(last_key, 0)) > 3600
-    if should_retrain:
-        model = NiftyPredictor()
+    model_key = f"model_{symbol}"
+    last_key  = f"last_train_{symbol}"
+    model = st.session_state.get(model_key)
+    now   = time.time()
+    if model is None or (now - st.session_state.get(last_key, 0)) > 3600:
+        model = M["NiftyPredictor"]()
         model.train(df)
-        _set_predictor(symbol, model)
-        st.session_state[last_key] = now
+        st.session_state[model_key] = model
+        st.session_state[last_key]  = now
     prediction   = model.predict(df)
     prediction30 = model.predict_30min(df)
     return model.metrics, prediction, prediction30, model
 
 
-# ── Daily (30-day) model ──────────────────────────────────────────────────
-@st.cache_resource(ttl=3600, show_spinner=False)
-def get_daily_model():
-    dm = NiftyDailyPredictor()
-    metrics = dm.train()
-    return dm, metrics
-
-
-# ── Intraday chart ────────────────────────────────────────────────────────
+# ── Chart builder ─────────────────────────────────────────────────────────
 def build_chart(df, prediction, symbol):
     display = df.tail(50).copy()
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
@@ -148,37 +149,14 @@ def build_chart(df, prediction, symbol):
     return fig
 
 
-# ── All-stocks scan ───────────────────────────────────────────────────────
-@st.cache_data(ttl=600, show_spinner=False)
-def scan_all_stocks():
-    results = []
-    for sym, name in NIFTY50_SYMBOLS.items():
-        try:
-            df_stock = load_data(sym)
-            mdl = NiftyPredictor()
-            mdl.train(df_stock)
-            pred = mdl.predict(df_stock)
-            if pred and pred["confidence"] >= MIN_CONFIDENCE * 100:
-                results.append({"Symbol": sym.replace(".NS","").replace("^",""),
-                    "Name": name, "Price": pred["current_price"],
-                    "Target": pred["predicted_price"],
-                    "Change": f"{pred['pct_change']:+.4f}%",
-                    "Direction": pred["direction"],
-                    "Confidence": f"{pred['confidence']:.1f}%"})
-        except Exception:
-            continue
-    results.sort(key=lambda x: float(x["Confidence"].rstrip("%")), reverse=True)
-    return results
-
-
 # ═══════════════════════════════════════════════════════════════════════════
-#  MAIN APP
+#  SIDEBAR
 # ═══════════════════════════════════════════════════════════════════════════
-market = get_market_status()
-if market["is_open"]:
-    st_autorefresh(interval=600_000, key="live_refresh")
+try:
+    market = M["get_market_status"]()
+except Exception:
+    market = {"is_open": False, "text": "Unknown", "time": datetime.now(IST).strftime("%H:%M:%S IST")}
 
-# ── Sidebar ───────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## 📈 Nifty50 Predictor")
     status_color = "#00E676" if market["is_open"] else "#FF5252"
@@ -197,17 +175,17 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Intraday Model**")
-    st.caption("Stacked: XGB + LightGBM-DART + Ridge")
+    st.caption("Stacked: XGB + LightGBM + Ridge")
     st.caption("MI selection (top 25) | Conformal 90%")
-    st.caption("Ternary: UP / HOLD / DOWN")
     st.markdown("**Daily Model (30-day)**")
-    st.caption("5yr training | 4 horizons: 5/10/20/30d")
+    st.caption("2yr training | 4 horizons: 5/10/20/30d")
     st.caption("Stacked + sentiment + global macro")
 
     st.divider()
-    show_scan = st.checkbox("Show all Nifty50 signals", value=False)
     if st.button("Force Retrain"):
-        st.session_state[f"last_train_{selected_symbol}"] = 0
+        for key in list(st.session_state.keys()):
+            if key.startswith("model_") or key.startswith("last_train_") or key == "daily_model_result":
+                del st.session_state[key]
         st.cache_data.clear()
         st.cache_resource.clear()
         st.rerun()
@@ -223,18 +201,12 @@ tab_intraday, tab_daily = st.tabs(["Intraday (10-min)", "30-Day Forecast"])
 with tab_intraday:
     with st.spinner("Loading data & training intraday model..."):
         try:
-            df_raw       = load_data(selected_symbol)
+            df_raw = load_data(selected_symbol)
             metrics, prediction, prediction30, model = train_and_predict(selected_symbol, df_raw)
             data_ok = True
         except Exception as e:
-            st.error(f"Failed: {e}")
+            st.error(f"Failed to load data: {e}")
             data_ok = False
-
-        # Load external features separately (non-critical, can fail)
-        try:
-            ext_features = load_external(selected_symbol) if data_ok else {}
-        except Exception:
-            ext_features = {}
 
     if not data_ok:
         st.stop()
@@ -273,7 +245,8 @@ with tab_intraday:
 
     st.divider()
 
-    # ── Global Market Context ─────────────────────────────────────────────
+    # ── Global Market Context (loaded on demand) ──────────────────────────
+    ext_features = load_external(selected_symbol)
     if ext_features:
         st.markdown("### 🌍 Market Context & Sentiment")
         def _arrow(v):
@@ -304,28 +277,6 @@ with tab_intraday:
             f"📰 News: <span style='color:{sent_color};font-weight:700'>{sent_label} ({news_score:+.2f})</span>"
             f" | {news_cnt} articles | India VIX: <b>{india_vix:.1f}</b></div>", unsafe_allow_html=True)
 
-    # ── Institutional Flows ───────────────────────────────────────────────
-    if ext_features:
-        with st.expander("🏦 Institutional Flows & Market Structure", expanded=True):
-            i1, i2, i3, i4, i5 = st.columns(5)
-            fii_net = ext_features.get("fii_net", 0)
-            dii_net = ext_features.get("dii_net", 0)
-            pcr = ext_features.get("pcr", 1.0)
-            breadth = ext_features.get("breadth_pct_above_ema50", 0.5) * 100
-            reddit = ext_features.get("reddit_sentiment", 0.0)
-            i1.metric("FII Net (Cr)", f"{fii_net:+,.0f}", "Buying" if fii_net > 0 else "Selling")
-            i2.metric("DII Net (Cr)", f"{dii_net:+,.0f}", "Buying" if dii_net > 0 else "Selling")
-            pcr_label = "Bearish" if pcr > 1.2 else ("Bullish" if pcr < 0.8 else "Neutral")
-            i3.metric("Put-Call Ratio", f"{pcr:.2f}", pcr_label)
-            i4.metric("Breadth (>EMA50)", f"{breadth:.1f}%",
-                      "Strong" if breadth > 60 else ("Weak" if breadth < 40 else "Neutral"))
-            reddit_label = "Bullish" if reddit > 0.1 else ("Bearish" if reddit < -0.1 else "Neutral")
-            reddit_col = "#00E676" if reddit > 0.1 else ("#FF5252" if reddit < -0.1 else "#FFD740")
-            i5.markdown(f"<div style='text-align:center'>"
-                f"<div style='font-size:0.75rem;color:#AAB4C8'>Reddit Sentiment</div>"
-                f"<div style='font-size:1rem;font-weight:700;color:{reddit_col}'>"
-                f"{reddit_label} ({reddit:+.2f})</div></div>", unsafe_allow_html=True)
-
     st.divider()
 
     # ── Chart ─────────────────────────────────────────────────────────────
@@ -335,9 +286,9 @@ with tab_intraday:
     # ── Confidence warning ────────────────────────────────────────────────
     if prediction:
         conf = prediction["confidence"]
-        if conf >= HIGH_CONFIDENCE * 100:
+        if conf >= M["HIGH_CONFIDENCE"] * 100:
             st.success(f"High confidence ({conf:.1f}%) — models strongly agree.")
-        elif conf >= MIN_CONFIDENCE * 100:
+        elif conf >= M["MIN_CONFIDENCE"] * 100:
             st.warning(f"Moderate confidence ({conf:.1f}%) — treat as indicative.")
         else:
             st.error(f"Low confidence ({conf:.1f}%) — avoid trading on this signal.")
@@ -351,7 +302,7 @@ with tab_intraday:
     m4.metric("Bias Correction", f"{metrics.get('bias_corr', 0):.4f}%")
 
     sc1, sc2, sc3, sc4 = st.columns(4)
-    sc1.metric("LightGBM-DART", "Active" if metrics.get("lgbm") else "N/A")
+    sc1.metric("LightGBM", "Active" if metrics.get("lgbm") else "N/A")
     sc2.metric("Stacking", "Active" if metrics.get("stacking") else "N/A")
     sc3.metric("Selected Features", f"{metrics.get('selected_features', 0)}/{metrics.get('active_features', 0)}")
     sc4.metric("Conformal Width", f"{metrics.get('conformal_width', 0):.4f}%")
@@ -366,23 +317,6 @@ with tab_intraday:
                 font=dict(color="#FAFAFA"), margin=dict(t=10, b=10, l=180, r=10))
             st.plotly_chart(fig_imp, use_container_width=True)
 
-    # ── All-stocks scan ───────────────────────────────────────────────────
-    if show_scan:
-        st.divider()
-        st.markdown("### All Nifty50 Signals")
-        with st.spinner("Scanning all 50 stocks..."):
-            scan_results = scan_all_stocks()
-        if scan_results:
-            scan_df = pd.DataFrame(scan_results)
-            def _dir_color(val):
-                if val == "UP": return "color: #00E676; font-weight:bold"
-                if val == "DOWN": return "color: #FF5252; font-weight:bold"
-                return "color: #FFD740; font-weight:bold"
-            st.dataframe(scan_df.style.map(_dir_color, subset=["Direction"]),
-                         use_container_width=True, hide_index=True)
-        else:
-            st.info("No high-confidence signals right now.")
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  TAB 2: 30-DAY FORECAST
@@ -392,11 +326,13 @@ with tab_daily:
 
     if "daily_model_result" not in st.session_state:
         st.markdown("### 30-Day Nifty 50 Forecast")
-        st.caption("Trains a stacked ensemble on 2 years of daily data with global macro + sentiment features.")
+        st.caption("Trains a stacked ensemble on 2 years of daily data with global macro + sentiment.")
+        st.caption("Click the button below to generate — takes about 1-2 minutes.")
         if st.button("Generate 30-Day Forecast", type="primary"):
-            with st.spinner("Fetching data & training model (this may take 1-2 minutes)..."):
+            with st.spinner("Fetching 2yr data & training 4-horizon model..."):
                 try:
-                    dm, dm_metrics = get_daily_model()
+                    dm = M["NiftyDailyPredictor"]()
+                    dm_metrics = dm.train()
                     dm_pred = dm.predict()
                     st.session_state["daily_model_result"] = (dm_metrics, dm_pred)
                     st.rerun()
@@ -429,18 +365,16 @@ with tab_daily:
 
         st.divider()
 
-        # ── Forecast chart with confidence bands ──────────────────────────
+        # ── Forecast chart ────────────────────────────────────────────────
         st.markdown("### Forecast Visualization")
-
         try:
             import yfinance as yf
-            hist_daily = yf.Ticker("^NSEI").history(period="6mo", interval="1d", auto_adjust=True)
-            hist_close = hist_daily["Close"].dropna().tail(90)
+            hist_daily = yf.Ticker("^NSEI").history(period="3mo", interval="1d", auto_adjust=True)
+            hist_close = hist_daily["Close"].dropna().tail(60)
         except Exception:
             hist_close = pd.Series(dtype=float)
 
         fig_fc = go.Figure()
-
         if not hist_close.empty:
             fig_fc.add_trace(go.Scatter(
                 x=hist_close.index, y=hist_close.values,
@@ -448,7 +382,7 @@ with tab_daily:
             ))
 
         today = datetime.now()
-        fc_dates = [today + timedelta(days=d) for d in [5, 10, 20, 30]]
+        fc_dates  = [today + timedelta(days=d) for d in [5, 10, 20, 30]]
         fc_prices = [dm_pred[h]["price"] for h in ["5d", "10d", "20d", "30d"]]
         fc_lows   = [dm_pred[h]["range_low"] for h in ["5d", "10d", "20d", "30d"]]
         fc_highs  = [dm_pred[h]["range_high"] for h in ["5d", "10d", "20d", "30d"]]
@@ -459,38 +393,33 @@ with tab_daily:
         all_highs  = [cur_price] + fc_highs
 
         fig_fc.add_trace(go.Scatter(
-            x=all_dates + all_dates[::-1],
-            y=all_highs + all_lows[::-1],
-            fill="toself", fillcolor="rgba(64, 196, 255, 0.15)",
+            x=all_dates + all_dates[::-1], y=all_highs + all_lows[::-1],
+            fill="toself", fillcolor="rgba(64,196,255,0.15)",
             line=dict(color="rgba(0,0,0,0)"), name="90% Confidence",
         ))
-
         fc_color = "#00E676" if fc_prices[-1] > cur_price else "#FF5252"
         fig_fc.add_trace(go.Scatter(
             x=all_dates, y=all_prices,
             line=dict(color=fc_color, width=3, dash="dash"), name="Forecast",
             mode="lines+markers", marker=dict(size=10),
         ))
-
         fig_fc.add_trace(go.Scatter(
             x=[today], y=[cur_price], mode="markers+text",
             marker=dict(size=14, color="#FFD740", symbol="star"),
             text=[f"₹{cur_price:,.0f}"], textposition="top center",
             textfont=dict(color="#FFD740", size=12), name="Current",
         ))
-
-        for i, (d, p, h) in enumerate(zip(fc_dates, fc_prices, ["5d","10d","20d","30d"])):
+        for d, p, h in zip(fc_dates, fc_prices, ["5d","10d","20d","30d"]):
             direction = dm_pred[h]["direction"]
-            color = "#00E676" if direction == "UP" else "#FF5252"
+            clr = "#00E676" if direction == "UP" else "#FF5252"
             fig_fc.add_annotation(x=d, y=p, text=f"₹{p:,.0f}<br>{h}",
-                showarrow=True, arrowhead=2, arrowcolor=color,
-                font=dict(color=color, size=11), bgcolor="#0E1117", bordercolor=color)
+                showarrow=True, arrowhead=2, arrowcolor=clr,
+                font=dict(color=clr, size=11), bgcolor="#0E1117", bordercolor=clr)
 
         fig_fc.update_layout(
             height=450, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
             font=dict(color="#FAFAFA"), margin=dict(t=30, b=10, l=10, r=10),
-            legend=dict(orientation="h", y=1.02, x=0),
-            yaxis_title="Nifty 50",
+            legend=dict(orientation="h", y=1.02, x=0), yaxis_title="Nifty 50",
         )
         fig_fc.update_xaxes(gridcolor="#2D3139")
         fig_fc.update_yaxes(gridcolor="#2D3139")
@@ -502,12 +431,9 @@ with tab_daily:
         for h, label in [("5d","5 Days"),("10d","10 Days"),("20d","20 Days"),("30d","30 Days")]:
             p = dm_pred[h]
             rows.append({
-                "Horizon": label,
-                "Price": f"₹{p['price']:,.2f}",
-                "Change": f"{p['pct_change']:+.2f}%",
-                "Direction": p["direction"],
-                "Low (P5)": f"₹{p['range_low']:,.0f}",
-                "High (P95)": f"₹{p['range_high']:,.0f}",
+                "Horizon": label, "Price": f"₹{p['price']:,.2f}",
+                "Change": f"{p['pct_change']:+.2f}%", "Direction": p["direction"],
+                "Low (P5)": f"₹{p['range_low']:,.0f}", "High (P95)": f"₹{p['range_high']:,.0f}",
                 "Confidence": f"{p['confidence']:.0f}%",
             })
         fc_df = pd.DataFrame(rows)
@@ -523,44 +449,10 @@ with tab_daily:
         for col, h, label in [(dm1,"5d","5-Day"),(dm2,"10d","10-Day"),(dm3,"20d","20-Day"),(dm4,"30d","30-Day")]:
             m = dm_metrics.get(h, {})
             with col:
-                st.metric(f"{label} MAE", f"{m.get('mae', 0)*100:.2f}%")
-                st.caption(f"R²: {m.get('r2', 0):.3f}")
-                st.caption(f"Dir acc: {m.get('dir_acc', 0):.1f}%")
-                st.caption(f"Samples: {m.get('n_samples', 0):,}")
-
-        # ── Sentiment used ────────────────────────────────────────────────
-        st.markdown("### Sentiment Inputs")
-        s1, s2, s3 = st.columns(3)
-        try:
-            from src.sentiment import fetch_news_sentiment, fetch_reddit_sentiment, fetch_market_breadth
-            news = fetch_news_sentiment("Nifty India stock market")
-            reddit = fetch_reddit_sentiment()
-            breadth = fetch_market_breadth()
-            ns = news.get("news_sentiment", 0)
-            rs = reddit.get("reddit_sentiment", 0)
-            br = breadth.get("breadth_pct_above_ema50", 0.5) * 100
-
-            nc = "#00E676" if ns > 0.1 else ("#FF5252" if ns < -0.1 else "#FFD740")
-            rc = "#00E676" if rs > 0.1 else ("#FF5252" if rs < -0.1 else "#FFD740")
-            bc = "#00E676" if br > 60 else ("#FF5252" if br < 40 else "#FFD740")
-
-            s1.markdown(f"<div style='text-align:center'>"
-                f"<div style='color:#AAB4C8'>📰 News Sentiment</div>"
-                f"<div style='font-size:1.5rem;font-weight:700;color:{nc}'>{ns:+.2f}</div>"
-                f"<div style='color:#666'>{news.get('news_count',0)} articles</div></div>",
-                unsafe_allow_html=True)
-            s2.markdown(f"<div style='text-align:center'>"
-                f"<div style='color:#AAB4C8'>💬 Reddit Sentiment</div>"
-                f"<div style='font-size:1.5rem;font-weight:700;color:{rc}'>{rs:+.2f}</div>"
-                f"<div style='color:#666'>{reddit.get('reddit_count',0)} posts</div></div>",
-                unsafe_allow_html=True)
-            s3.markdown(f"<div style='text-align:center'>"
-                f"<div style='color:#AAB4C8'>📊 Market Breadth</div>"
-                f"<div style='font-size:1.5rem;font-weight:700;color:{bc}'>{br:.0f}%</div>"
-                f"<div style='color:#666'>Nifty50 above EMA50</div></div>",
-                unsafe_allow_html=True)
-        except Exception:
-            st.caption("Sentiment data unavailable")
+                st.metric(f"{label} MAE", f"{m.get('mae',0)*100:.2f}%")
+                st.caption(f"R²: {m.get('r2',0):.3f}")
+                st.caption(f"Dir acc: {m.get('dir_acc',0):.1f}%")
+                st.caption(f"Samples: {m.get('n_samples',0):,}")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────
