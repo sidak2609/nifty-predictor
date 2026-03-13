@@ -9,8 +9,8 @@ import time
 import pytz
 
 from src.constants import NIFTY50_SYMBOLS, NIFTY_INDEX, MIN_CONFIDENCE, HIGH_CONFIDENCE
-from src.data_fetcher import fetch_ohlcv, get_market_status
-from src.features import engineer_features, engineer_lag_features
+from src.data_fetcher import fetch_ohlcv, fetch_daily_ohlcv, get_market_status
+from src.features import engineer_features, engineer_lag_features, compute_daily_context, merge_daily_context
 from src.model import NiftyPredictor
 from src.sentiment import (
     get_all_external_features,
@@ -37,6 +37,7 @@ st.markdown("""
     .conf-low  { color: #FF5252; }
     .tag-up    { background:#00E676; color:#000; padding:3px 10px; border-radius:12px; font-weight:700; }
     .tag-down  { background:#FF5252; color:#fff; padding:3px 10px; border-radius:12px; font-weight:700; }
+    .tag-hold  { background:#FFD740; color:#000; padding:3px 10px; border-radius:12px; font-weight:700; }
     .section-title { font-size:1.1rem; font-weight:600; color:#AAB4C8; margin-bottom:8px; }
 </style>
 """, unsafe_allow_html=True)
@@ -57,12 +58,22 @@ def load_global_hist() -> pd.DataFrame:
     return fetch_global_markets_historical(days=70)
 
 @st.cache_data(ttl=600, show_spinner=False)
+def load_daily_ctx(symbol: str) -> pd.DataFrame:
+    """1-year daily OHLCV for multi-timeframe context features."""
+    daily = fetch_daily_ohlcv(symbol, period="1y")
+    if daily.empty:
+        return pd.DataFrame()
+    return compute_daily_context(daily)
+
+@st.cache_data(ttl=600, show_spinner=False)
 def load_data(symbol: str) -> pd.DataFrame:
-    raw      = fetch_ohlcv(symbol, days=55)
+    raw      = fetch_ohlcv(symbol, days=58)
     df       = engineer_features(raw)
     df       = engineer_lag_features(df)
     hist_ext = load_global_hist()
     df       = merge_global_historical(df, hist_ext)
+    daily_ctx = load_daily_ctx(symbol)
+    df       = merge_daily_context(df, daily_ctx)
     return df
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -120,7 +131,8 @@ def build_chart(df: pd.DataFrame, prediction, symbol: str):
     if prediction:
         last_time = display.index[-1]
         pred_time = last_time + pd.tseries.frequencies.to_offset("10min")
-        color = "#00E676" if prediction["direction"] == "UP" else "#FF5252"
+        d = prediction["direction"]
+        color = "#00E676" if d == "UP" else ("#FF5252" if d == "DOWN" else "#FFD740")
         fig.add_trace(go.Scatter(
             x=[pred_time], y=[prediction["predicted_price"]],
             mode="markers+text",
@@ -215,11 +227,12 @@ with st.sidebar:
 
     st.divider()
     st.markdown("**Model Config**")
-    st.caption("• Training: last 30 days (rolling)")
-    st.caption("• Ensemble: XGBoost × 3 + LightGBM + MLP")
-    st.caption("• 3 session sub-models (time-of-day)")
-    st.caption("• Horizons: 10-min & 30-min")
-    st.caption(f"• Min confidence: {int(MIN_CONFIDENCE*100)}%")
+    st.caption("• Training: last 55 days (rolling)")
+    st.caption("• Stacked: XGB-shallow + XGB-deep + LightGBM-DART + Ridge")
+    st.caption("• Meta-learner: Ridge (heavily regularized)")
+    st.caption("• MI feature selection (top 25)")
+    st.caption("• Conformal 90% intervals")
+    st.caption("• Ternary direction: UP / HOLD / DOWN")
 
     st.divider()
     show_scan = st.checkbox("Show all Nifty50 signals", value=False)
@@ -271,10 +284,15 @@ with c4:
                     unsafe_allow_html=True)
 with c5:
     if prediction:
-        tag = "tag-up" if prediction["direction"] == "UP" else "tag-down"
-        arr = "▲" if prediction["direction"] == "UP" else "▼"
+        d = prediction["direction"]
+        if d == "UP":
+            tag, arr = "tag-up", "▲"
+        elif d == "DOWN":
+            tag, arr = "tag-down", "▼"
+        else:
+            tag, arr = "tag-hold", "→"  # HOLD
         st.markdown(f"<p class='section-title'>Direction</p>"
-                    f"<p><span class='{tag}'>{arr} {prediction['direction']}</span></p>",
+                    f"<p><span class='{tag}'>{arr} {d}</span></p>",
                     unsafe_allow_html=True)
 with c6:
     if prediction:
@@ -382,17 +400,17 @@ m2.metric("Price MAPE",           f"{metrics.get('mape', 0):.3f}%")
 m3.metric("Training Samples",     f"{metrics.get('n_samples', 0):,}")
 m4.metric("Bias Correction",      f"{metrics.get('bias_corr', 0):.4f}%")
 
-# Session model status
+# Model architecture status
 sc1, sc2, sc3, sc4 = st.columns(4)
-trained = metrics.get("sessions_trained", [])
-sc1.metric("LightGBM",       "✓ Active" if metrics.get("lgbm") else "✗ Unavailable")
-sc2.metric("MLP Sequence",   "✓ Active" if metrics.get("mlp")  else "✗ Unavailable")
-sc3.metric("Session Models", f"{len(trained)}/3 trained")
-sc4.metric("Sessions",       ", ".join(trained) if trained else "none")
+sc1.metric("LightGBM-DART",   "Active" if metrics.get("lgbm") else "N/A")
+sc2.metric("Stacking",        "Active" if metrics.get("stacking") else "N/A")
+sc3.metric("Selected Features", f"{metrics.get('selected_features', 0)}/{metrics.get('active_features', 0)}")
+sc4.metric("Conformal Width",  f"{metrics.get('conformal_width', 0):.4f}%")
 
 st.caption(
-    "Walk-forward CV on last 30 days | XGBoost ensemble + LightGBM + MLP + session sub-models | "
-    "Features: 62 technical + 23 external signals"
+    f"Purged walk-forward CV | Stacked ensemble: XGB-shallow + XGB-deep + LightGBM-DART + Ridge | "
+    f"MI feature selection ({metrics.get('selected_features', 0)} of {len(model.mi_scores)} features) | "
+    f"Conformal 90% intervals | Ternary classifier (UP/FLAT/DOWN)"
 )
 
 # ── Feature importance ────────────────────────────────────────────────────
@@ -429,7 +447,9 @@ if show_scan:
     if scan_results:
         scan_df = pd.DataFrame(scan_results)
         def _dir_color(val):
-            return "color: #00E676; font-weight:bold" if val == "UP" else "color: #FF5252; font-weight:bold"
+            if val == "UP": return "color: #00E676; font-weight:bold"
+            if val == "DOWN": return "color: #FF5252; font-weight:bold"
+            return "color: #FFD740; font-weight:bold"
         st.dataframe(scan_df.style.map(_dir_color, subset=["Direction"]),
                      use_container_width=True, hide_index=True)
         up   = sum(1 for r in scan_results if r["Direction"] == "UP")

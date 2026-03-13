@@ -9,6 +9,9 @@ MLP_BASE_FEATURES = ["returns_1", "rsi14", "macd_hist", "vol_ratio", "price_vs_v
 MLP_N_LAGS = 10
 MLP_LAG_COLS = [f"{f}_lag{l}" for f in MLP_BASE_FEATURES for l in range(1, MLP_N_LAGS + 1)]
 
+# Ternary target deadzone
+DEADZONE = 0.0005  # 0.05% — returns within this are classified as FLAT
+
 
 def _add_vwap(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -62,8 +65,8 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ema9_cross_ema21"] = (df["ema9"] > df["ema21"]).astype(int)
 
     # ── RSI ───────────────────────────────────────────────────────────────
-    df["rsi14"]     = ta.momentum.rsi(df["close"], window=14)
-    df["rsi7"]      = ta.momentum.rsi(df["close"], window=7)
+    df["rsi14"]       = ta.momentum.rsi(df["close"], window=14)
+    df["rsi7"]        = ta.momentum.rsi(df["close"], window=7)
     df["rsi_diverge"] = df["rsi14"] - df["rsi7"]
 
     # ── MACD ──────────────────────────────────────────────────────────────
@@ -151,6 +154,57 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         ((df.index.hour == 13) & (df.index.minute <= 30))
     ).astype(int)
 
+    # ── NEW: Intraday cumulative features ─────────────────────────────────
+    dates = df.index.date
+
+    # Gap at open (vs previous day close)
+    unique_dates = sorted(set(dates))
+    gap_map = {}
+    for i, d in enumerate(unique_dates):
+        day_mask = dates == d
+        day_data = df.loc[day_mask]
+        if day_data.empty:
+            gap_map[d] = 0.0
+            continue
+        day_open = day_data["open"].iloc[0]
+        if i > 0:
+            prev_d = unique_dates[i - 1]
+            prev_data = df.loc[dates == prev_d]
+            if not prev_data.empty:
+                prev_close = prev_data["close"].iloc[-1]
+                gap_map[d] = (day_open - prev_close) / prev_close
+            else:
+                gap_map[d] = 0.0
+        else:
+            gap_map[d] = 0.0
+    df["gap_pct"] = [gap_map.get(d, 0.0) for d in dates]
+
+    # Cumulative intraday return from today's open
+    day_open = df.groupby(dates)["open"].transform("first")
+    df["intraday_return"] = (df["close"] - day_open) / day_open
+
+    # Distance from day's running high / low
+    df["day_high_so_far"] = df.groupby(dates)["high"].cummax()
+    df["day_low_so_far"]  = df.groupby(dates)["low"].cummin()
+    df["dist_day_high"]   = (df["close"] - df["day_high_so_far"]) / df["close"]
+    df["dist_day_low"]    = (df["close"] - df["day_low_so_far"]) / df["close"]
+    df.drop(columns=["day_high_so_far", "day_low_so_far"], inplace=True)
+
+    # ── NEW: Regime detection ─────────────────────────────────────────────
+    df["rvol_10"] = df["returns_1"].rolling(10).std()
+    df["rvol_30"] = df["returns_1"].rolling(30).std()
+    df["vol_regime"] = (df["rvol_10"] / df["rvol_30"].replace(0, np.nan)).fillna(1.0)
+
+    # Kaufman efficiency ratio (0→choppy, 1→trending)
+    direction  = (df["close"] - df["close"].shift(10)).abs()
+    volatility = df["returns_1"].abs().rolling(10).sum()
+    df["efficiency_ratio"] = (direction / volatility.replace(0, np.nan)).fillna(0.5)
+
+    # ── NEW: Microstructure proxy ─────────────────────────────────────────
+    hl_range = (df["high"] - df["low"]).replace(0, np.nan)
+    df["clv"]     = (((df["close"] - df["low"]) - (df["high"] - df["close"])) / hl_range).fillna(0)
+    df["clv_ma5"] = df["clv"].rolling(5).mean()
+
     # ── Session label (for time-of-day models) ────────────────────────────
     df["session"] = [
         _session_label(h, m) for h, m in zip(df.index.hour, df.index.minute)
@@ -163,16 +217,63 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     df["target_return_3"]  = df["close"].pct_change(3).shift(-3)   # 30-min ahead
     df["target_price_3"]   = df["close"].shift(-3)
 
+    # Smoothed forward target (average of next 3 candle closes vs current)
+    fwd_avg = (df["close"].shift(-1) + df["close"].shift(-2) + df["close"].shift(-3)) / 3
+    df["target_return_smooth"] = (fwd_avg - df["close"]) / df["close"]
+
+    # Ternary direction with deadzone (2=UP, 1=FLAT, 0=DOWN)
+    df["target_direction_3class"] = np.where(
+        df["target_return_smooth"] > DEADZONE, 2,
+        np.where(df["target_return_smooth"] < -DEADZONE, 0, 1)
+    )
+
     return df
 
 
 def engineer_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Add lag features for MLP: top 5 features × 10 lags = 50 columns."""
+    """Add lag features for MLP: top 5 features x 10 lags = 50 columns."""
     df = df.copy()
     for feat in MLP_BASE_FEATURES:
         if feat in df.columns:
             for lag in range(1, MLP_N_LAGS + 1):
                 df[f"{feat}_lag{lag}"] = df[feat].shift(lag)
+    return df
+
+
+def compute_daily_context(daily_df: pd.DataFrame) -> pd.DataFrame:
+    """Compute daily-resolution features from 1-year daily OHLCV.
+    Returns a date-indexed DataFrame to merge into intraday bars."""
+    d = daily_df.copy()
+    d["daily_return_5d"]  = d["close"].pct_change(5)
+    d["daily_return_20d"] = d["close"].pct_change(20)
+    d["daily_vol_5d"]     = d["close"].pct_change(1).rolling(5).std()
+    d["daily_vol_20d"]    = d["close"].pct_change(1).rolling(20).std()
+    d["vol_ratio_5_20"]   = (d["daily_vol_5d"] / d["daily_vol_20d"].replace(0, np.nan)).fillna(1.0)
+    d["dist_20d_high"]    = (d["close"] - d["close"].rolling(20).max()) / d["close"]
+    d["dist_20d_low"]     = (d["close"] - d["close"].rolling(20).min()) / d["close"]
+
+    # Shift by 1 day to avoid look-ahead bias
+    cols = ["daily_return_5d", "daily_return_20d", "daily_vol_5d",
+            "daily_vol_20d", "vol_ratio_5_20", "dist_20d_high", "dist_20d_low"]
+    result = d[cols].shift(1)
+    result.index = result.index.normalize()
+    if result.index.tzinfo is not None:
+        result.index = result.index.tz_localize(None)
+    return result
+
+
+def merge_daily_context(df: pd.DataFrame, daily_ctx: pd.DataFrame) -> pd.DataFrame:
+    """Join daily context features into intraday DataFrame by date."""
+    if daily_ctx.empty:
+        return df
+    df = df.copy()
+    df_dates = df.index.normalize()
+    if df.index.tzinfo is not None:
+        df_dates = df_dates.tz_localize(None)
+    for col in daily_ctx.columns:
+        mapping = dict(zip(daily_ctx.index, daily_ctx[col]))
+        df[col] = df_dates.map(mapping)
+        df[col] = df[col].ffill().fillna(0.0)
     return df
 
 
@@ -201,6 +302,12 @@ FEATURE_COLS = [
     # Time
     "session_progress", "hour_sin",
     "is_open_rush", "is_close_rush", "is_lunch",
+    # NEW: Intraday cumulative
+    "gap_pct", "intraday_return", "dist_day_high", "dist_day_low",
+    # NEW: Regime detection
+    "vol_regime", "efficiency_ratio",
+    # NEW: Microstructure proxy
+    "clv", "clv_ma5",
     # Global market context (historical daily — varies day-to-day in training)
     "sp500_change", "nasdaq_change", "dow_change",
     "india_vix", "india_vix_change",
@@ -208,6 +315,8 @@ FEATURE_COLS = [
     "nikkei_change", "hangseng_change",
     "usdinr", "usdinr_change",
     "gold_change", "crude_change",
-    # NOTE: news_sentiment, fii_net, dii_net, pcr, reddit_sentiment, breadth
-    # are point-in-time only (no historical API) → display panel only, not in model
+    # Daily multi-timeframe context (1-year history)
+    "daily_return_5d", "daily_return_20d",
+    "daily_vol_5d", "daily_vol_20d", "vol_ratio_5_20",
+    "dist_20d_high", "dist_20d_low",
 ]

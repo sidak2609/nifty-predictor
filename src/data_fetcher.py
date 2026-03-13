@@ -69,6 +69,25 @@ def fetch_ohlcv(symbol: str, days: int = 55) -> pd.DataFrame:
     return df
 
 
+def fetch_daily_ohlcv(symbol: str, period: str = "1y") -> pd.DataFrame:
+    """Fetch daily OHLCV (up to 1 year) for multi-timeframe context features."""
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval="1d", auto_adjust=True)
+    except Exception:
+        return pd.DataFrame()
+
+    if df.empty:
+        return pd.DataFrame()
+
+    if df.index.tzinfo is not None:
+        df.index = df.index.tz_convert(IST)
+    df.index = df.index.normalize().tz_localize(None)
+    df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df.columns = ["open", "high", "low", "close", "volume"]
+    return df
+
+
 def get_current_price(symbol: str) -> float | None:
     """Return latest close price."""
     try:
