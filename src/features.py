@@ -188,4 +188,12 @@ FEATURE_COLS = [
     # Time
     "session_progress", "hour_sin",
     "is_open_rush", "is_close_rush", "is_lunch",
+    # Global market context (from sentiment module)
+    "sp500_change", "nasdaq_change", "dow_change",
+    "india_vix", "india_vix_change",
+    "vix_level", "vix_change",
+    "nikkei_change", "hangseng_change",
+    "usdinr", "usdinr_change",
+    "gold_change", "crude_change",
+    "news_sentiment", "news_count",
 ]

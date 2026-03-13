@@ -12,6 +12,7 @@ from src.constants import NIFTY50_SYMBOLS, NIFTY_INDEX, MIN_CONFIDENCE, HIGH_CON
 from src.data_fetcher import fetch_ohlcv, get_market_status
 from src.features import engineer_features
 from src.model import NiftyPredictor
+from src.sentiment import get_all_external_features, merge_into_df
 
 IST = pytz.timezone("Asia/Kolkata")
 
@@ -189,10 +190,13 @@ def build_chart(df: pd.DataFrame, prediction: dict | None, symbol: str) -> go.Fi
 # ── All-stocks scan ──────────────────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
 def scan_all_stocks() -> list[dict]:
+    # Fetch global features once, reuse for all stocks
+    shared_ext = get_all_external_features("^NSEI")
     results = []
     for sym, name in NIFTY50_SYMBOLS.items():
         try:
-            df = load_data(sym)
+            df_raw = load_data(sym)
+            df     = merge_into_df(df_raw, shared_ext)
             model = NiftyPredictor()
             model.train(df)
             pred = model.predict(df)
@@ -257,16 +261,26 @@ with st.sidebar:
 # ── Header ────────────────────────────────────────────────────────────────────
 st.title(f"📈  {selected_name}  ({selected_symbol.replace('.NS','').replace('^','')})")
 
-# ── Load data & train ─────────────────────────────────────────────────────────
-with st.spinner(f"Loading data and training model for {selected_symbol}…"):
+# ── Load data, sentiment & train ──────────────────────────────────────────────
+with st.spinner(f"Loading data, sentiment & training model for {selected_symbol}…"):
     try:
-        df = load_data(selected_symbol)
+        df_raw = load_data(selected_symbol)
+
+        # Fetch external features (global markets + news) — cached 10 min
+        @st.cache_data(ttl=600, show_spinner=False)
+        def load_external(sym):
+            return get_all_external_features(sym)
+
+        ext_features = load_external(selected_symbol)
+        df = merge_into_df(df_raw, ext_features)
+
         metrics, prediction = train_and_predict(selected_symbol, df)
         data_ok = True
     except Exception as e:
         st.error(f"Failed to load data for {selected_symbol}: {e}")
         st.info("This can happen when Yahoo Finance temporarily doesn't have data for this symbol. Try selecting a different stock or click 'Force Retrain' in the sidebar.")
         data_ok = False
+        ext_features = {}
 
 if not data_ok:
     st.stop()
@@ -312,8 +326,63 @@ with col5:
 
 st.divider()
 
+# ── Global Market Sentiment Panel ─────────────────────────────────────────────
+if ext_features:
+    st.markdown("### 🌍 Market Context & Sentiment")
+
+    def _arrow(val):
+        if val > 0.1:  return f"▲ +{val:.2f}%"
+        if val < -0.1: return f"▼ {val:.2f}%"
+        return f"→ {val:.2f}%"
+
+    def _color(val):
+        if val > 0.1:  return "#00E676"
+        if val < -0.1: return "#FF5252"
+        return "#FFD740"
+
+    g1, g2, g3, g4, g5, g6, g7, g8 = st.columns(8)
+
+    items = [
+        (g1, "S&P 500",    ext_features.get("sp500_change", 0)),
+        (g2, "Nasdaq",     ext_features.get("nasdaq_change", 0)),
+        (g3, "Nikkei",     ext_features.get("nikkei_change", 0)),
+        (g4, "Hang Seng",  ext_features.get("hangseng_change", 0)),
+        (g5, "Gold",       ext_features.get("gold_change", 0)),
+        (g6, "Crude Oil",  ext_features.get("crude_change", 0)),
+        (g7, "USD/INR",    ext_features.get("usdinr_change", 0)),
+        (g8, "India VIX",  ext_features.get("india_vix_change", 0)),
+    ]
+    for col, label, val in items:
+        col.markdown(
+            f"<div style='text-align:center'>"
+            f"<div style='font-size:0.75rem; color:#AAB4C8'>{label}</div>"
+            f"<div style='font-size:1rem; font-weight:700; color:{_color(val)}'>{_arrow(val)}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+    # News sentiment bar
+    news_score = ext_features.get("news_sentiment", 0)
+    news_count = int(ext_features.get("news_count", 0))
+    news_pos   = int(ext_features.get("news_pos", 0))
+    news_neg   = int(ext_features.get("news_neg", 0))
+
+    sent_label = "Bullish" if news_score > 0.1 else ("Bearish" if news_score < -0.1 else "Neutral")
+    sent_color = "#00E676" if news_score > 0.1 else ("#FF5252" if news_score < -0.1 else "#FFD740")
+    india_vix  = ext_features.get("india_vix", 0)
+
+    st.markdown(
+        f"<div style='margin-top:8px; font-size:0.9rem;'>"
+        f"📰 News Sentiment: <span style='color:{sent_color}; font-weight:700'>{sent_label} ({news_score:+.2f})</span>"
+        f" &nbsp;|&nbsp; {news_count} articles &nbsp;|&nbsp; 👍 {news_pos} positive signals &nbsp;|&nbsp; 👎 {news_neg} negative signals"
+        f" &nbsp;|&nbsp; India VIX: <b>{india_vix:.1f}</b>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
 # ── Chart ─────────────────────────────────────────────────────────────────────
-chart = build_chart(df, prediction, selected_symbol)
+chart = build_chart(df_raw, prediction, selected_symbol)
 st.plotly_chart(chart, use_container_width=True)
 
 # ── Confidence warning ────────────────────────────────────────────────────────
