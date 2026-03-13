@@ -12,8 +12,9 @@ def fetch_ohlcv(symbol: str, days: int = 55) -> pd.DataFrame:
     Fetch 5-min OHLCV from yfinance and resample to 10-min bars.
     Returns DataFrame indexed by IST datetime.
     """
-    end = datetime.now(IST)
-    start = end - timedelta(days=days)
+    now   = datetime.now(IST)
+    end   = now + timedelta(days=1)   # +1 so today's data is included (yfinance end is exclusive)
+    start = now - timedelta(days=days)
 
     try:
         ticker = yf.Ticker(symbol)
